@@ -1,5 +1,5 @@
 /* Annos – service worker: sovellus ja suomalaiset tuotteet toimivat ilman verkkoa */
-const VERSION = 'annos-2.1.0-d1ff9473da';
+const VERSION = 'annos-2.2.0-6b68b3c800';
 const FONTS = 'annos-fonts';
 const OCR = 'annos-ocr-1'; // tekstintunnistuksen tiedostot säilyvät päivitysten yli
 const SHELL = ['./', 'index.html', 'manifest.json', 'icon-192.png', 'icon-512.png', 'tuotteet-fi.json'];
@@ -29,7 +29,8 @@ self.addEventListener('fetch', e => {
         const hit = await c.match(url.href);
         if (hit) return hit;
         const r = await fetch(req);
-        if (r && r.ok) await c.put(url.href, r.clone());
+        // Tallennus ei saa estää vastausta (esim. jos puhelimen tallennustila on täynnä)
+        if (r && r.ok && r.type === 'basic') e.waitUntil(c.put(url.href, r.clone()).catch(() => {}));
         return r;
       })());
       return;
