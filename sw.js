@@ -1,5 +1,5 @@
 /* Annos – service worker: sovellus ja suomalaiset tuotteet toimivat ilman verkkoa */
-const VERSION = 'annos-2.0.0-2026-11-12';
+const VERSION = 'annos-2.0.1-2496395486';
 const FONTS = 'annos-fonts';
 const SHELL = ['./', 'index.html', 'manifest.json', 'icon-192.png', 'icon-512.png', 'tuotteet-fi.json'];
 

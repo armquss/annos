@@ -424,6 +424,9 @@ button.gitem:active { background: var(--surface-2); }
 (function () {
   'use strict';
   let zxingPromise = null;
+  // Upotettu ZXing-lähde otetaan talteen heti, ennen kuin sovellus rakentaa sivun
+  const zxEl = document.getElementById('zxing-src');
+  const ZX_SRC = zxEl ? zxEl.textContent : '';
 
   function loadZXing() {
     if (window.ZXing) return Promise.resolve(window.ZXing);
@@ -431,8 +434,7 @@ button.gitem:active { background: var(--surface-2); }
       zxingPromise = new Promise((resolve, reject) => {
         const s = document.createElement('script');
         // ZXing on upotettu sivuun, jotta skannaus toimii myös ilman verkkoa
-        const src = document.getElementById('zxing-src');
-        if (src) s.src = URL.createObjectURL(new Blob([src.textContent], { type: 'text/javascript' }));
+        if (ZX_SRC) s.src = URL.createObjectURL(new Blob([ZX_SRC], { type: 'text/javascript' }));
         else s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
         s.onload = () => (window.ZXing ? resolve(window.ZXing) : reject(new Error('ZXing puuttuu')));
         s.onerror = () => { zxingPromise = null; reject(new Error('ZXing ei latautunut')); };
@@ -505,8 +507,10 @@ button.gitem:active { background: var(--surface-2); }
     return sys + m + chk;
   }
 
+  const OK_FORMATS = /^(ean_?13|ean_?8|upc_?a|upc_?e)$/i;
   function clean(raw, format) {
     if (!raw) return null;
+    if (format && !OK_FORMATS.test(format)) return null;
     let c = String(raw).replace(/\D/g, '');
     if (format && /upc_?e/i.test(format) && c.length === 8) c = upcEtoA(c);
     return validGtin(c) ? c : null;
@@ -534,32 +538,38 @@ button.gitem:active { background: var(--surface-2); }
     return null;
   }
 
-  async function viaZXing(bmp, deadline) {
+  async function viaZXing(bmp, deadline, cancelled) {
     const ZX = await loadZXing();
-    const hints = new Map();
-    hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.EAN_8, ZX.BarcodeFormat.UPC_A, ZX.BarcodeFormat.UPC_E]);
-    hints.set(ZX.DecodeHintType.TRY_HARDER, true);
-    const reader = new ZX.MultiFormatReader();
-    reader.setHints(hints);
+    const formats = [ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.EAN_8, ZX.BarcodeFormat.UPC_A, ZX.BarcodeFormat.UPC_E];
+    // Nopea lukija kaikille yrityksille; perusteellinen (TRY_HARDER) vain lopuksi muutamalle kuvalle
+    const mk = hard => { const hm = new Map(); hm.set(ZX.DecodeHintType.POSSIBLE_FORMATS, formats); if (hard) hm.set(ZX.DecodeHintType.TRY_HARDER, true); const r = new ZX.MultiFormatReader(); r.setHints(hm); return r; };
+    const fast = mk(false), hard = mk(true);
     const tries = [
       { m: 1200 }, { m: 1200, c: 0.6 }, { m: 1800 }, { m: 900 },
       { m: 1200, r: 90 }, { m: 1400, c: 0.45 }, { m: 1200, c: 0.6, r: 90 },
       { m: 2200, c: 0.7 }, { m: 700 }, { m: 1600, c: 0.35 }
     ];
     const binarizers = [ZX.HybridBinarizer, ZX.GlobalHistogramBinarizer];
+    const attempt = (reader, canvas, B) => {
+      try {
+        const res = reader.decodeWithState(new ZX.BinaryBitmap(new B(new ZX.HTMLCanvasElementLuminanceSource(canvas))));
+        return clean(res.getText(), ZX.BarcodeFormat[res.getBarcodeFormat()] || '');
+      } catch (e) { return null; /* ei löytynyt tästä yrityksestä */ }
+    };
     for (const t of tries) {
       const canvas = draw(bmp, t.m, t.c, t.r);
       for (const B of binarizers) {
-        if (Date.now() > deadline) return null;
-        try {
-          const src = new ZX.HTMLCanvasElementLuminanceSource(canvas);
-          const res = reader.decode(new ZX.BinaryBitmap(new B(src)));
-          const fmt = ZX.BarcodeFormat[res.getBarcodeFormat()] || '';
-          const code = clean(res.getText(), fmt);
-          if (code) return code;
-        } catch (e) { /* ei löytynyt tästä yrityksestä */ }
+        if (Date.now() > deadline || (cancelled && cancelled())) return null;
+        const code = attempt(fast, canvas, B);
+        if (code) return code;
         await sleep();
       }
+    }
+    for (const t of tries.slice(0, 3)) {
+      if (Date.now() > deadline || (cancelled && cancelled())) return null;
+      const code = attempt(hard, draw(bmp, Math.min(t.m, 1200), t.c, t.r), ZX.HybridBinarizer);
+      if (code) return code;
+      await sleep();
     }
     return null;
   }
@@ -573,8 +583,8 @@ button.gitem:active { background: var(--surface-2); }
       code = await viaNative(bmp);
       if (code) via = 'native';
     }
-    if (!code) {
-      code = await viaZXing(bmp, deadline);
+    if (!code && !(opts && opts.cancelled && opts.cancelled())) {
+      code = await viaZXing(bmp, deadline, opts && opts.cancelled);
       if (code) via = 'zxing';
     }
     if (bmp.close) try { bmp.close(); } catch (e) { /* */ }
@@ -596,12 +606,12 @@ button.gitem:active { background: var(--surface-2); }
       ZXref = await loadZXing();
       const hints = new Map();
       hints.set(ZXref.DecodeHintType.POSSIBLE_FORMATS, [ZXref.BarcodeFormat.EAN_13, ZXref.BarcodeFormat.EAN_8, ZXref.BarcodeFormat.UPC_A, ZXref.BarcodeFormat.UPC_E]);
-      hints.set(ZXref.DecodeHintType.TRY_HARDER, true);
+      // Kameran kuvavirrassa ilman TRY_HARDERia: nopeampi, ja kuvia tulee useita sekunnissa
       frameReader = new ZXref.MultiFormatReader();
       frameReader.setHints(hints);
     }
     try {
-      const res = frameReader.decode(new ZXref.BinaryBitmap(new ZXref.HybridBinarizer(new ZXref.HTMLCanvasElementLuminanceSource(canvas))));
+      const res = frameReader.decodeWithState(new ZXref.BinaryBitmap(new ZXref.HybridBinarizer(new ZXref.HTMLCanvasElementLuminanceSource(canvas))));
       return clean(res.getText(), ZXref.BarcodeFormat[res.getBarcodeFormat()] || '');
     } catch (e) { return null; }
   }
@@ -611,11 +621,11 @@ button.gitem:active { background: var(--surface-2); }
 
 </script>
 <script>
-/* Annos – ruokapäiväkirja ja kalorilaskuri. Asennettava versio 2.0.0 */
+/* Annos – ruokapäiväkirja ja kalorilaskuri. Asennettava versio 2.0.1 */
 (function () {
 'use strict';
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const DATA_VERSION = '2026-11-12';
 const DATA_DATE = '12.11.2026';
 const GENERIC_RAW = [["g:omena","Omena","Hedelmät ja marjat",52.0,0.3,11.4,10.4,0.2,0.0,2.4,0.0,[["1 keskikokoinen",150],["1 pieni",110],["1 iso",200]],"omppu","usda"],["g:banaani","Banaani","Hedelmät ja marjat",89.0,1.1,20.2,12.2,0.3,0.1,2.6,0.0,[["1 keskikokoinen (kuorittu)",120],["1 pieni",90],["1 iso",150]],"","usda"],["g:appelsiini","Appelsiini","Hedelmät ja marjat",47.0,0.9,9.3,9.3,0.1,0.0,2.4,0.0,[["1 keskikokoinen (kuorittu)",140]],"","usda"],["g:mandariini-klementiini","Mandariini / klementiini","Hedelmät ja marjat",53.0,0.8,11.5,10.6,0.3,0.0,1.8,0.01,[["1 kpl (kuorittu)",70]],"klementiini satsuma","usda"],["g:paaryna","Päärynä","Hedelmät ja marjat",57.0,0.4,12.1,9.8,0.1,0.0,3.1,0.0,[["1 keskikokoinen",170]],"","usda"],["g:viinirypaleet","Viinirypäleet","Hedelmät ja marjat",69.0,0.7,17.2,15.5,0.2,0.1,0.9,0.01,[["1 dl",70],["10 kpl",50]],"rypäle viinirypäle","usda"],["g:mansikka","Mansikka","Hedelmät ja marjat",32.0,0.7,5.7,4.9,0.3,0.0,2.0,0.0,[["1 dl",65],["1 kpl",12]],"mansikat","usda"],["g:mustikka","Mustikka","Hedelmät ja marjat",57.0,0.7,12.1,10.0,0.3,0.0,2.4,0.0,[["1 dl",65]],"mustikat blueberry","usda"],["g:vadelma","Vadelma","Hedelmät ja marjat",52.0,1.2,5.4,4.4,0.7,0.0,6.5,0.0,[["1 dl",50]],"vadelmat","usda"],["g:puolukka","Puolukka","Hedelmät ja marjat",55.0,0.4,12.2,null,0.5,null,null,null,[["1 dl",60]],"puolukat","usda"],["g:lakka-hilla","Lakka (hilla)","Hedelmät ja marjat",51.0,2.4,8.6,null,0.8,null,null,null,[["1 dl",60]],"hilla suomuurain","usda"],["g:karpalo","Karpalo","Hedelmät ja marjat",46.0,0.5,8.4,4.3,0.1,0.0,3.6,0.01,[["1 dl",45]],"karpalot","usda"],["g:mustaherukka","Mustaherukka","Hedelmät ja marjat",63.0,1.4,15.4,null,0.4,0.0,null,0.01,[["1 dl",55]],"herukka","usda"],["g:karviainen","Karviainen","Hedelmät ja marjat",44.0,0.9,5.9,null,0.6,0.0,4.3,0.0,[["1 dl",60]],"karviaiset","usda"],["g:kiivi","Kiivi","Hedelmät ja marjat",61.0,1.1,11.7,9.0,0.5,0.0,3.0,0.01,[["1 kpl (kuorittu)",70]],"kiwi","usda"],["g:ananas","Ananas","Hedelmät ja marjat",50.0,0.5,11.7,9.8,0.1,0.0,1.4,0.0,[["1 viipale",85],["1 dl paloina",70]],"","usda"],["g:mango","Mango","Hedelmät ja marjat",60.0,0.8,13.4,13.7,0.4,0.1,1.6,0.0,[["1 kpl (syötävä osa)",200],["1 dl paloina",70]],"","usda"],["g:persikka","Persikka","Hedelmät ja marjat",39.0,0.9,8.0,8.4,0.2,0.0,1.5,0.0,[["1 kpl",150]],"","usda"],["g:nektariini","Nektariini","Hedelmät ja marjat",44.0,1.1,8.9,7.9,0.3,0.0,1.7,0.0,[["1 kpl",140]],"","usda"],["g:luumu","Luumu","Hedelmät ja marjat",46.0,0.7,10.0,9.9,0.3,0.0,1.4,0.0,[["1 kpl",60]],"luumut","usda"],["g:kirsikka","Kirsikka","Hedelmät ja marjat",63.0,1.1,13.9,12.8,0.2,0.0,2.1,0.0,[["1 dl",70],["10 kpl",70]],"kirsikat","usda"],["g:vesimeloni","Vesimeloni","Hedelmät ja marjat",30.0,0.6,7.1,6.2,0.1,0.0,0.4,0.0,[["1 lohko",300],["1 dl paloina",75]],"meloni","usda"],["g:hunajameloni","Hunajameloni","Hedelmät ja marjat",36.0,0.5,8.3,8.1,0.1,0.0,0.8,0.04,[["1 lohko",160],["1 dl paloina",85]],"meloni","usda"],["g:cantaloupe-meloni","Cantaloupe-meloni","Hedelmät ja marjat",34.0,0.8,7.3,7.9,0.2,0.1,0.9,0.04,[["1 lohko",140]],"meloni verkkomeloni","usda"],["g:sitruuna","Sitruuna","Hedelmät ja marjat",29.0,1.1,6.5,2.5,0.3,0.0,2.8,0.01,[["1 kpl (kuorittu)",60]],"","usda"],["g:greippi","Greippi","Hedelmät ja marjat",33.0,0.7,7.3,7.3,0.1,0.0,1.1,0.0,[["½ kpl",125]],"","usda"],["g:avokado","Avokado","Hedelmät ja marjat",160,2.0,1.8,0.7,14.7,2.1,6.7,0.02,[["½ kpl",75],["1 kpl",150]],"","usda"],["g:rusinat","Rusinat","Hedelmät ja marjat",299,3.3,74.8,65.2,0.2,0.1,4.5,0.07,[["1 rkl",10],["1 dl",60]],"rusina","usda"],["g:taatelit-medjool","Taatelit (medjool)","Hedelmät ja marjat",277,1.8,68.3,66.5,0.1,null,6.7,0.0,[["1 kpl",24]],"taateli","usda"],["g:kuivatut-aprikoosit","Kuivatut aprikoosit","Hedelmät ja marjat",241,3.4,55.3,53.4,0.5,0.0,7.3,0.03,[["1 kpl",8]],"aprikoosi","usda"],["g:kurkku","Kurkku","Vihannekset ja palkokasvit",15.0,0.7,3.1,1.7,0.1,0.0,0.5,0.01,[["10 cm pala",100],["1 kpl",350],["3 viipaletta",20]],"kurkut","usda"],["g:tomaatti","Tomaatti","Vihannekset ja palkokasvit",18.0,0.9,2.7,2.6,0.2,0.0,1.2,0.01,[["1 keskikokoinen",100],["1 kirsikkatomaatti",15]],"kirsikkatomaatti tomaatit","usda"],["g:paprika-punainen","Paprika, punainen","Vihannekset ja palkokasvit",26.0,1.0,3.9,4.2,0.3,0.1,2.1,0.01,[["1 kpl",150],["1 dl paloina",60]],"paprika","usda"],["g:paprika-vihrea","Paprika, vihreä","Vihannekset ja palkokasvit",20.0,0.9,2.9,2.4,0.2,0.1,1.7,0.01,[["1 kpl",150]],"paprika","usda"],["g:porkkana","Porkkana","Vihannekset ja palkokasvit",41.0,0.9,6.8,4.7,0.2,0.0,2.8,0.17,[["1 keskikokoinen",70],["1 dl raasteena",45]],"porkkanat","usda"],["g:jaavuorisalaatti","Jäävuorisalaatti","Vihannekset ja palkokasvit",14.0,0.9,1.8,2.0,0.1,0.0,1.2,0.03,[["1 dl silputtuna",20],["1 kerä",500]],"salaatti","usda"],["g:lehtisalaatti","Lehtisalaatti","Vihannekset ja palkokasvit",15.0,1.4,1.6,0.8,0.1,0.0,1.3,0.07,[["1 dl",15],["1 annos",40]],"salaatti","usda"],["g:roomansalaatti","Roomansalaatti","Vihannekset ja palkokasvit",17.0,1.2,1.2,1.2,0.3,0.0,2.1,0.02,[["1 dl",20]],"salaatti romaine","usda"],["g:rucola","Rucola","Vihannekset ja palkokasvit",25.0,2.6,2.0,2.0,0.7,0.1,1.6,0.07,[["1 dl",10],["1 pussi",65]],"rukola","usda"],["g:pinaatti","Pinaatti","Vihannekset ja palkokasvit",23.0,2.9,1.4,0.4,0.4,0.1,2.2,0.2,[["1 dl",15],["1 pussi",65]],"","usda"],["g:lehtikaali","Lehtikaali","Vihannekset ja palkokasvit",35.0,2.9,0.3,1.0,1.5,0.2,4.1,0.13,[["1 dl",20]],"kale","usda"],["g:parsakaali","Parsakaali","Vihannekset ja palkokasvit",34.0,2.8,4.0,1.7,0.4,0.1,2.6,0.08,[["1 dl",40],["1 kerä",300]],"brokkoli","usda"],["g:parsakaali-keitetty","Parsakaali, keitetty","Vihannekset ja palkokasvit",35.0,2.4,3.9,1.4,0.4,0.1,3.3,0.1,[["1 dl",70]],"brokkoli","usda"],["g:kukkakaali","Kukkakaali","Vihannekset ja palkokasvit",25.0,1.9,3.0,1.9,0.3,0.1,2.0,0.07,[["1 dl",40]],"","usda"],["g:kesakurpitsa","Kesäkurpitsa","Vihannekset ja palkokasvit",17.0,1.2,2.1,2.5,0.3,0.1,1.0,0.02,[["1 kpl",250],["1 dl paloina",50]],"kurpitsa zucchini","usda"],["g:sipuli","Sipuli","Vihannekset ja palkokasvit",40.0,1.1,7.6,4.2,0.1,0.0,1.7,0.01,[["1 keskikokoinen",80],["1 rkl silputtuna",10]],"kepasipuli","usda"],["g:valkosipuli","Valkosipuli","Vihannekset ja palkokasvit",149,6.4,31.0,1.0,0.5,0.1,2.1,0.04,[["1 kynsi",3]],"","usda"],["g:herneet-pakaste-keitetty","Herneet, pakaste, keitetty","Vihannekset ja palkokasvit",78.0,5.2,9.8,4.4,0.3,0.0,4.5,0.18,[["1 dl",65]],"herne","usda"],["g:maissi-sailyke","Maissi, säilyke","Vihannekset ja palkokasvit",67.0,2.3,12.3,4.4,1.2,0.2,2.0,0.51,[["1 dl",70],["1 rkl",10]],"","usda"],["g:punajuuri-keitetty","Punajuuri, keitetty","Vihannekset ja palkokasvit",44.0,1.7,8.0,8.0,0.2,0.0,2.0,0.19,[["1 keskikokoinen",80]],"punajuuret","usda"],["g:valkokaali","Valkokaali","Vihannekset ja palkokasvit",25.0,1.3,3.3,3.2,0.1,0.0,2.5,0.04,[["1 dl silputtuna",30]],"kaali","usda"],["g:punakaali","Punakaali","Vihannekset ja palkokasvit",31.0,1.4,5.3,3.8,0.2,0.0,2.1,0.07,[["1 dl silputtuna",30]],"kaali","usda"],["g:lanttu-keitetty","Lanttu, keitetty","Vihannekset ja palkokasvit",30.0,0.9,5.0,4.0,0.2,0.0,1.8,0.01,[["1 dl",70]],"","usda"],["g:herkkusieni","Herkkusieni","Vihannekset ja palkokasvit",22.0,3.1,2.3,2.0,0.3,0.1,1.0,0.01,[["1 kpl",18],["1 dl viipaleina",30]],"sieni sienet","usda"],["g:kantarelli","Kantarelli","Vihannekset ja palkokasvit",32.0,1.5,3.1,1.2,0.5,null,3.8,0.02,[["1 dl",30]],"sieni sienet keltavahvero","usda"],["g:retiisi","Retiisi","Vihannekset ja palkokasvit",16.0,0.7,1.8,1.9,0.1,0.0,1.6,0.1,[["1 kpl",10]],"","usda"],["g:varsiselleri","Varsiselleri","Vihannekset ja palkokasvit",14.0,0.7,1.4,1.3,0.2,0.0,1.6,0.2,[["1 varsi",40]],"selleri","usda"],["g:munakoiso","Munakoiso","Vihannekset ja palkokasvit",25.0,1.0,2.9,3.5,0.2,0.0,3.0,0.01,[["1 kpl",300]],"aubergine","usda"],["g:vihreat-pavut","Vihreät pavut","Vihannekset ja palkokasvit",31.0,1.8,4.3,3.3,0.2,0.1,2.7,0.01,[["1 dl",45]],"pavut","usda"],["g:ruusukaali","Ruusukaali","Vihannekset ja palkokasvit",43.0,3.4,5.1,2.2,0.3,0.1,3.8,0.06,[["1 kpl",20]],"","usda"],["g:parsa","Parsa","Vihannekset ja palkokasvit",20.0,2.2,1.8,1.9,0.1,0.0,2.1,0.01,[["1 kpl",20]],"","usda"],["g:kikherneet-keitetty","Kikherneet, keitetty","Vihannekset ja palkokasvit",164,8.9,19.8,4.8,2.6,0.3,7.6,0.02,[["1 dl",70]],"kikherne","usda"],["g:linssit-keitetty","Linssit, keitetty","Vihannekset ja palkokasvit",116,9.0,12.2,1.8,0.4,0.1,7.9,0.01,[["1 dl",80]],"linssi","usda"],["g:kidneypavut-sailyke","Kidneypavut, säilyke","Vihannekset ja palkokasvit",124,8.0,16.0,3.8,1.1,0.2,5.5,0.58,[["1 dl",70]],"pavut","usda"],["g:edamame-soijapavut","Edamame-soijapavut","Vihannekset ja palkokasvit",121,11.9,3.7,2.2,5.2,0.6,5.2,0.01,[["1 dl",60]],"soijapavut","usda"],["g:tofu","Tofu","Vihannekset ja palkokasvit",144,17.3,0.5,null,8.7,1.3,2.3,0.04,[["1 annos",100]],"","usda"],["g:oliivit","Oliivit","Vihannekset ja palkokasvit",116,0.8,4.4,0.0,10.9,2.3,1.6,1.84,[["1 kpl",4]],"oliivi","usda"],["g:suolakurkku","Suolakurkku","Vihannekset ja palkokasvit",12.0,0.5,1.4,1.1,0.3,0.1,1.0,2.02,[["1 kpl",60],["1 viipale",7]],"etikkakurkku","usda"],["g:hapankaali","Hapankaali","Vihannekset ja palkokasvit",19.0,0.9,1.4,1.8,0.1,0.0,2.9,1.65,[["1 dl",70]],"","usda"],["g:peruna-keitetty","Peruna, keitetty","Peruna, riisi ja pasta",87.0,1.9,18.3,0.9,0.1,0.0,1.8,0.01,[["1 keskikokoinen",75],["1 iso",120]],"perunat","usda"],["g:perunamuusi","Perunamuusi","Peruna, riisi ja pasta",113,1.9,15.3,1.4,4.2,2.6,1.5,0.79,[["1 dl",85],["1 annos",200]],"muusi perunasose","usda"],["g:uuniperuna","Uuniperuna","Peruna, riisi ja pasta",93.0,2.5,18.9,1.2,0.1,0.0,2.2,0.03,[["1 kpl",200]],"peruna","usda"],["g:ranskalaiset-uunissa-paistetut","Ranskalaiset, uunissa paistetut","Peruna, riisi ja pasta",168,2.7,26.1,0.3,5.2,1.0,2.6,0.08,[["1 annos",150]],"ranskanperunat","usda"],["g:bataatti-uunissa-paistettu","Bataatti, uunissa paistettu","Peruna, riisi ja pasta",90.0,2.0,17.4,6.5,0.1,0.1,3.3,0.09,[["1 kpl",200]],"bataatti","usda"],["g:riisi-keitetty","Riisi, keitetty","Peruna, riisi ja pasta",130,2.7,27.8,0.1,0.3,0.1,0.4,0.0,[["1 dl",80],["1 annos",150]],"jasmiiniriisi basmati","usda"],["g:taysjyvariisi-keitetty","Täysjyväriisi, keitetty","Peruna, riisi ja pasta",123,2.7,24.0,0.2,1.0,0.3,1.6,0.01,[["1 dl",80],["1 annos",150]],"riisi","usda"],["g:pasta-keitetty","Pasta, keitetty","Peruna, riisi ja pasta",158,5.8,29.1,0.6,0.9,0.2,1.8,0.0,[["1 dl",50],["1 annos",180]],"makaroni spagetti","usda"],["g:taysjyvapasta-keitetty","Täysjyväpasta, keitetty","Peruna, riisi ja pasta",149,6.0,26.2,0.8,1.7,0.2,3.9,0.01,[["1 dl",50],["1 annos",180]],"makaroni spagetti","usda"],["g:kananmunanuudelit-keitetty","Kananmunanuudelit, keitetty","Peruna, riisi ja pasta",138,4.5,24.0,0.4,2.1,0.4,1.2,0.41,[["1 annos",160]],"nuudeli","usda"],["g:riisinuudelit-keitetty","Riisinuudelit, keitetty","Peruna, riisi ja pasta",108,1.8,23.0,0.0,0.2,0.0,1.0,0.05,[["1 annos",160]],"nuudeli","usda"],["g:kuskus-keitetty","Kuskus, keitetty","Peruna, riisi ja pasta",112,3.8,21.8,0.1,0.2,0.0,1.4,0.01,[["1 dl",65],["1 annos",150]],"couscous","usda"],["g:bulgur-keitetty","Bulgur, keitetty","Peruna, riisi ja pasta",83.0,3.1,14.1,0.1,0.2,0.0,4.5,0.01,[["1 dl",75],["1 annos",150]],"","usda"],["g:kvinoa-keitetty","Kvinoa, keitetty","Peruna, riisi ja pasta",120,4.4,18.5,0.9,1.9,0.2,2.8,0.02,[["1 dl",75],["1 annos",150]],"quinoa","usda"],["g:ohrasuurimot-keitetty","Ohrasuurimot, keitetty","Peruna, riisi ja pasta",123,2.3,24.4,0.3,0.4,0.1,3.8,0.01,[["1 dl",65]],"ohra","usda"],["g:kaurahiutaleet","Kaurahiutaleet","Puurot ja murot",379,13.2,57.6,1.0,6.5,1.1,10.1,0.01,[["1 dl",35],["1 rkl",5]],"kaura hiutaleet","usda"],["g:kaurapuuro-vedella","Kaurapuuro vedellä","Puurot ja murot",71.0,2.5,10.3,0.3,1.5,0.3,1.7,0.01,[["1 annos (2,5 dl)",250],["1 dl",100]],"puuro kaura","usda"],["g:riisipuuro","Riisipuuro","Puurot ja murot",123,2.6,17.1,7.1,4.6,2.8,0.6,1.25,[["1 annos (2,5 dl)",250]],"puuro","off"],["g:mannapuuro","Mannapuuro","Puurot ja murot",70,3.2,9.1,3.4,2.4,1.6,0.2,0.57,[["1 annos (2,5 dl)",250]],"puuro","off"],["g:maissihiutaleet","Maissihiutaleet","Puurot ja murot",384,5.9,85.3,7.8,0.9,0.2,2.7,1.43,[["1 dl",12],["1 annos",30]],"cornflakes murot","usda"],["g:mysli","Mysli","Puurot ja murot",393,9.9,56.0,17.0,12.0,0.8,9.2,0.4,[["1 dl",40]],"myslit","off"],["g:granola","Granola","Puurot ja murot",430,11.0,54.0,17.0,15.0,1.9,18.0,0.8,[["1 dl",45]],"murot","off"],["g:vehnaleseet","Vehnäleseet","Puurot ja murot",216,15.6,21.7,0.4,4.2,0.6,42.8,0.01,[["1 rkl",5]],"leseet","usda"],["g:ruisleipa","Ruisleipä","Leivät ja leivonnaiset",238,8.4,43.8,1.6,1.6,0.6,10.0,3.07,[["1 viipale",30],["1 ruispala",60]],"ruis leipä ruispalat","off"],["g:nakkileipa","Näkkileipä","Leivät ja leivonnaiset",341,10.0,59.0,0.5,2.8,0.5,19.0,1.4,[["1 kpl",10]],"hapankorppu","off"],["g:paahtoleipa-vaalea","Paahtoleipä, vaalea","Leivät ja leivonnaiset",257,8.4,45.0,2.4,4.0,0.3,3.8,0.3,[["1 viipale",30]],"paahtoleipä vehnäleipä","off"],["g:paahtoleipa-taysjyva","Paahtoleipä, täysjyvä","Leivät ja leivonnaiset",260,9.6,48.0,6.0,2.8,0.4,6.4,2.75,[["1 viipale",30]],"paahtoleipä","off"],["g:sampyla-vaalea","Sämpylä, vaalea","Leivät ja leivonnaiset",278,9.8,46.9,3.2,4.7,0.9,7.1,1.08,[["1 kpl",70]],"leipä","off"],["g:patonki","Patonki","Leivät ja leivonnaiset",272,10.8,49.7,4.6,2.4,0.5,2.2,1.5,[["1 viipale",25]],"leipä","usda"],["g:karjalanpiirakka","Karjalanpiirakka","Leivät ja leivonnaiset",170,5.0,31.8,1.9,1.8,0.9,2.3,1.08,[["1 kpl",60]],"piirakka riisipiirakka","off"],["g:croissant","Croissant","Leivät ja leivonnaiset",406,8.2,43.2,11.3,21.0,11.7,2.6,0.96,[["1 kpl",60]],"voisarvi","usda"],["g:pulla-korvapuusti","Pulla / korvapuusti","Leivät ja leivonnaiset",321,7.9,48.0,13.0,10.0,2.8,3.1,0.7,[["1 korvapuusti",70],["1 pullaviipale",40]],"pulla korvapuusti kanelipulla","off"],["g:munkki","Munkki","Leivät ja leivonnaiset",339,5.8,51.0,25.0,13.0,3.9,1.5,0.5,[["1 kpl",70]],"donitsi","off"],["g:lettu-ohukainen","Lettu / ohukainen","Leivät ja leivonnaiset",227,6.4,28.3,null,9.7,2.1,null,1.1,[["1 kpl",50]],"pannukakku letut","usda"],["g:vohveli","Vohveli","Leivät ja leivonnaiset",291,7.9,32.9,null,14.1,2.9,null,1.28,[["1 kpl",35]],"","usda"],["g:riisikakku","Riisikakku","Leivät ja leivonnaiset",386,8.1,75.9,null,3.8,0.6,4.0,0.28,[["1 kpl",8]],"riisikakut","usda"],["g:juustokakku","Juustokakku","Leivät ja leivonnaiset",321,5.5,25.1,21.8,22.5,9.9,0.4,1.09,[["1 pala",100]],"kakku","usda"],["g:rasvaton-maito","Rasvaton maito","Maito ja maitotuotteet",33,3.3,4.9,4.9,0.0,0.0,0.0,0.1,[["1 lasi (2 dl)",200],["1 dl",100]],"maito","off"],["g:kevytmaito","Kevytmaito","Maito ja maitotuotteet",46,3.3,4.8,4.8,1.5,0.9,0.0,0.1,[["1 lasi (2 dl)",200],["1 dl",100]],"maito","off"],["g:taysmaito","Täysmaito","Maito ja maitotuotteet",64,3.3,4.8,4.8,3.5,2.2,0.0,0.1,[["1 lasi (2 dl)",200],["1 dl",100]],"maito","off"],["g:laktoositon-kevytmaitojuoma","Laktoositon kevytmaitojuoma","Maito ja maitotuotteet",39,3.3,3.1,3.1,1.5,0.9,0.0,0.1,[["1 lasi (2 dl)",200]],"maito eila","off"],["g:piima","Piimä","Maito ja maitotuotteet",32,3.3,4.5,4.5,0.1,0.1,4.3,0.1,[["1 lasi (2 dl)",200]],"kirnupiimä","off"],["g:kaurajuoma","Kaurajuoma","Maito ja maitotuotteet",51,0.9,8.2,3.8,1.5,0.2,0.3,0.1,[["1 lasi (2 dl)",200],["1 dl",100]],"kaura","off"],["g:soijajuoma","Soijajuoma","Maito ja maitotuotteet",40,3.0,3.1,2.5,1.7,0.2,1.1,0.4,[["1 lasi (2 dl)",200]],"soija","off"],["g:jogurtti-maustamaton","Jogurtti, maustamaton","Maito ja maitotuotteet",60,4.2,4.6,4.6,2.5,1.5,0.0,0.11,[["1 purkki",150],["1 dl",100]],"jogurtti","off"],["g:jogurtti-maustettu","Jogurtti, maustettu","Maito ja maitotuotteet",74,3.4,10.0,9.9,2.0,1.2,0.8,0.1,[["1 purkki",150],["1 dl",100]],"jogurtti","off"],["g:turkkilainen-jogurtti","Turkkilainen jogurtti","Maito ja maitotuotteet",119,3.3,4.0,4.0,10.0,6.5,0.8,0.08,[["1 dl",100],["1 rkl",20]],"jogurtti","off"],["g:kreikkalainen-jogurtti","Kreikkalainen jogurtti","Maito ja maitotuotteet",97,5.6,4.6,4.6,6.0,3.5,0.8,0.06,[["1 dl",100]],"jogurtti","off"],["g:maitorahka","Maitorahka","Maito ja maitotuotteet",60,10.0,4.0,4.0,0.3,0.2,0.0,0.1,[["1 purkki (250 g)",250],["1 dl",110]],"rahka","off"],["g:rahka-maustettu","Rahka, maustettu","Maito ja maitotuotteet",92,5.4,13.0,13.0,2.1,1.3,0.3,0.09,[["1 purkki (200 g)",200]],"rahka","off"],["g:viili","Viili","Maito ja maitotuotteet",65,3.2,4.7,4.7,3.5,2.3,null,0.08,[["1 purkki",200],["1 dl",100]],"","off"],["g:raejuusto","Raejuusto","Maito ja maitotuotteet",80,14.0,2.0,2.0,2.0,1.2,0.1,0.69,[["1 dl",95],["1 rasia (200 g)",200]],"raejuusto cottage","off"],["g:kermaviili","Kermaviili","Maito ja maitotuotteet",118,3.2,4.0,4.0,10.0,6.0,3.0,0.1,[["1 rkl",15],["1 dl",100]],"smetana","off"],["g:ruokakerma","Ruokakerma","Maito ja maitotuotteet",148,2.6,5.0,2.9,13.0,8.5,0.0,0.52,[["1 dl",100],["1 rkl",15]],"kerma","off"],["g:vispikerma","Vispikerma","Maito ja maitotuotteet",335,2.0,3.0,3.0,35.0,21.0,1.8,0.07,[["1 dl",100],["1 rkl",15]],"kerma kuohukerma","off"],["g:kahvikerma","Kahvikerma","Maito ja maitotuotteet",131,3.1,4.3,4.1,11.5,7.0,0.0,0.15,[["1 rkl",15],["1 dl",100]],"kerma","usda"],["g:kermajaatelo-vanilja","Kermajäätelö, vanilja","Maito ja maitotuotteet",227,2.8,29.0,24.0,10.0,6.7,0.2,0.1,[["1 pallo",50],["1 dl",55]],"jäätelö","off"],["g:juusto-n-2530-rasvaa","Juusto, n. 25–30 % rasvaa","Juustot",342,27.0,0.0,0.0,26.0,14.0,0.0,1.28,[["1 ohut viipale",10],["1 paksu viipale",20]],"edam juusto viipale","off"],["g:kevytjuusto-n-1517-rasvaa","Kevytjuusto, n. 15–17 % rasvaa","Juustot",269,29.0,0.0,0.0,17.0,10.0,0.0,1.4,[["1 ohut viipale",10],["1 paksu viipale",20]],"kevyt juusto viipale","off"],["g:mozzarella","Mozzarella","Juustot",299,22.2,2.4,0.0,22.1,13.9,0.0,1.22,[["1 pallo",125],["1 dl raasteena",40]],"juusto","usda"],["g:fetajuusto","Fetajuusto","Juustot",265,14.2,3.9,0.0,21.5,13.3,0.0,2.85,[["1 dl paloina",50]],"feta juusto salaattijuusto","usda"],["g:parmesaani","Parmesaani","Juustot",420,28.4,13.9,0.1,27.8,15.4,0.0,4.51,[["1 rkl raastetta",6]],"parmesan juusto","usda"],["g:tuorejuusto","Tuorejuusto","Juustot",226,5.4,4.3,4.3,21.0,14.0,0.2,0.74,[["1 rkl",15]],"juusto","off"],["g:brie","Brie","Juustot",334,20.8,0.5,0.5,27.7,17.4,0.0,1.57,[["1 pala",20]],"juusto","usda"],["g:sinihomejuusto","Sinihomejuusto","Juustot",353,21.4,2.3,0.5,28.7,18.7,0.0,2.87,[["1 pala",20]],"aura homejuusto","usda"],["g:halloumi","Halloumi","Juustot",315,20.0,3.0,2.1,25.0,17.5,1.6,1.82,[["1 viipale",30],["1 pkt",200]],"grillijuusto","off"],["g:leipajuusto","Leipäjuusto","Juustot",280,18.0,2.5,2.5,22.0,15.5,0.0,0.0,[["1 pala",30]],"juustoleipä","off"],["g:broilerin-rintafilee-raaka","Broilerin rintafilee (raaka)","Liha ja broileri",120,22.5,0.0,0.0,2.6,0.6,0.0,0.11,[["1 filee",150],["1 annos",125]],"kana broileri kananrinta","usda"],["g:broilerin-rintafilee-kypsa","Broilerin rintafilee, kypsä","Liha ja broileri",165,31.0,0.0,0.0,3.6,1.0,0.0,0.18,[["1 filee",110],["1 annos",100]],"kana broileri kananrinta","usda"],["g:broilerin-rintafilee-maustettu-raaka","Broilerin rintafilee, maustettu (raaka)","Liha ja broileri",100,19.0,0.5,0.0,2.6,0.5,0.1,1.1,[["1 annos",125]],"kana broileri marinoitu","off"],["g:broilerin-koipireisi-kypsa","Broilerin koipireisi, kypsä","Liha ja broileri",191,23.4,0.0,0.0,10.2,2.7,0.0,0.31,[["1 kpl",150]],"kana broileri koipi reisi","usda"],["g:broilerin-reisifilee-kypsa","Broilerin reisifilee, kypsä","Liha ja broileri",179,24.8,0.0,0.0,8.2,2.3,0.0,0.27,[["1 annos",100]],"kana broileri","usda"],["g:naudan-jauheliha-10-raaka","Naudan jauheliha 10 % (raaka)","Liha ja broileri",168,20.0,0.0,0.0,10.0,5.2,0.0,0.12,[["1 pkt",400],["1 annos",125]],"jauheliha nauta","off"],["g:naudan-jauheliha-17-raaka","Naudan jauheliha 17 % (raaka)","Liha ja broileri",227,19.0,0.0,0.0,17.0,8.9,0.0,0.14,[["1 pkt",400],["1 annos",125]],"jauheliha nauta","off"],["g:sika-nauta-jauheliha-raaka","Sika-nauta-jauheliha (raaka)","Liha ja broileri",249,17.0,0.0,0.0,20.0,8.9,0.0,0.14,[["1 pkt",400],["1 annos",125]],"jauheliha","off"],["g:naudan-jauheliha-10-kypsa","Naudan jauheliha 10 %, kypsä","Liha ja broileri",230,28.4,0.0,0.0,12.0,4.7,0.0,0.22,[["1 annos",100]],"jauheliha","usda"],["g:porsaan-ulkofilee-raaka","Porsaan ulkofilee (raaka)","Liha ja broileri",109,20.9,0.0,0.0,2.2,0.7,0.0,0.13,[["1 annos",150]],"possu sika porsas","usda"],["g:porsaan-ulkofilee-kypsa","Porsaan ulkofilee, kypsä","Liha ja broileri",143,26.2,0.0,0.0,3.5,1.2,0.0,0.14,[["1 annos",120]],"possu sika porsas","usda"],["g:naudan-pihvi-sisapaisti-kypsa","Naudan pihvi (sisäpaisti), kypsä","Liha ja broileri",178,29.4,0.0,0.0,5.8,2.2,0.0,0.15,[["1 pihvi",180]],"pihvi nauta härkä","usda"],["g:lohi-raaka","Lohi (raaka)","Kala ja äyriäiset",208,20.4,0.0,0.0,13.4,3.0,0.0,0.15,[["1 pala",125]],"kala lohifilee","usda"],["g:lohi-kypsa","Lohi, kypsä","Kala ja äyriäiset",206,22.1,0.0,0.0,12.3,2.4,0.0,0.15,[["1 pala",110]],"kala lohifilee","usda"],["g:kirjolohi-kypsa","Kirjolohi, kypsä","Kala ja äyriäiset",168,23.8,0.0,0.0,7.4,1.7,0.0,0.15,[["1 pala",110]],"kala","usda"],["g:tonnikala-vedessa-sailyke","Tonnikala vedessä, säilyke","Kala ja äyriäiset",86.0,19.4,0.0,0.0,1.0,0.2,0.0,0.62,[["1 purkki valutettuna",130],["1 rkl",15]],"kala tonnikala","usda"],["g:seiti-kypsa","Seiti, kypsä","Kala ja äyriäiset",118,24.9,0.0,null,1.3,0.2,0.0,0.28,[["1 pala",110]],"kala","usda"],["g:turska-kypsa","Turska, kypsä","Kala ja äyriäiset",105,22.8,0.0,0.0,0.9,0.2,0.0,0.2,[["1 pala",110]],"kala","usda"],["g:ahven-kypsa","Ahven, kypsä","Kala ja äyriäiset",117,24.9,0.0,null,1.2,0.2,0.0,0.2,[["1 annos",100]],"kala","usda"],["g:hauki-kypsa","Hauki, kypsä","Kala ja äyriäiset",113,24.7,0.0,null,0.9,0.2,0.0,0.12,[["1 annos",110]],"kala","usda"],["g:silli-raaka","Silli (raaka)","Kala ja äyriäiset",158,18.0,0.0,0.0,9.0,2.0,0.0,0.23,[["1 annos",100]],"kala silakka","usda"],["g:marinoitu-silli","Marinoitu silli","Kala ja äyriäiset",200,11.0,11.0,11.0,13.0,2.5,0.0,6.89,[["1 annos",60]],"kala silli","off"],["g:katkaravut-kypsa","Katkaravut, kypsä","Kala ja äyriäiset",99.0,24.0,0.2,null,0.3,0.1,null,0.28,[["1 dl",60],["1 annos",100]],"katkarapu","usda"],["g:simpukat-kypsa","Simpukat, kypsä","Kala ja äyriäiset",172,23.8,7.4,null,4.5,0.8,0.0,0.92,[["1 annos",100]],"simpukka sinisimpukka","usda"],["g:kananmuna-keitetty","Kananmuna, keitetty","Kananmuna",155,12.6,1.1,1.1,10.6,3.3,0.0,0.31,[["1 kpl (keskikokoinen)",55],["1 kpl (iso)",62]],"muna kananmunat","usda"],["g:kananmuna-raaka","Kananmuna (raaka)","Kananmuna",143,12.6,0.7,0.4,9.5,3.1,0.0,0.35,[["1 kpl (keskikokoinen)",55],["1 kpl (iso)",62]],"muna","usda"],["g:paistettu-kananmuna","Paistettu kananmuna","Kananmuna",196,13.6,0.8,0.4,14.8,4.3,0.0,0.52,[["1 kpl",50]],"muna paistettu","usda"],["g:munakokkeli","Munakokkeli","Kananmuna",149,10.0,1.6,1.4,11.0,3.3,0.0,0.36,[["1 annos (2 munaa)",120]],"muna munakas","usda"],["g:munanvalkuainen","Munanvalkuainen","Kananmuna",52.0,10.9,0.7,0.7,0.2,0.0,0.0,0.41,[["1 kpl",33]],"muna valkuainen","usda"],["g:munankeltuainen","Munankeltuainen","Kananmuna",322,15.9,3.6,0.6,26.5,9.6,0.0,0.12,[["1 kpl",17]],"muna keltuainen","usda"],["g:keittokinkku-leike","Keittokinkku, leike","Leikkeleet ja makkarat",100,18.0,0.0,0.3,3.0,1.2,0.0,1.67,[["1 viipale",10]],"kinkku leikkele","off"],["g:kalkkunaleike","Kalkkunaleike","Leikkeleet ja makkarat",96,15.0,2.0,0.2,3.0,0.7,0.2,1.87,[["1 viipale",10]],"kalkkuna leikkele","off"],["g:broilerleike","Broilerleike","Leikkeleet ja makkarat",109,19.5,1.5,0.2,2.7,0.6,0.2,0.8,[["1 viipale",10]],"kana leikkele","off"],["g:meetvursti","Meetvursti","Leikkeleet ja makkarat",401,20.0,1.2,0.2,35.0,13.2,0.0,4.0,[["1 viipale",6]],"leikkele","off"],["g:salami","Salami","Leikkeleet ja makkarat",376,24.0,1.5,1.2,30.0,12.0,0.4,3.84,[["1 viipale",6]],"leikkele","off"],["g:nakit","Nakit","Leikkeleet ja makkarat",218,8.3,7.5,0.7,17.0,5.2,0.9,5.0,[["1 nakki",35]],"nakki makkara","off"],["g:lenkkimakkara","Lenkkimakkara","Leikkeleet ja makkarat",229,9.2,8.9,0.3,17.3,6.5,0.4,1.93,[["1 siivu (1 cm)",15],["1 annos",100]],"makkara","off"],["g:grillimakkara","Grillimakkara","Leikkeleet ja makkarat",266,12.0,2.8,0.9,23.0,9.4,0.0,1.97,[["1 kpl",80]],"makkara","off"],["g:pekoni-raaka","Pekoni (raaka)","Leikkeleet ja makkarat",320,12.0,0.3,0.3,30.0,12.0,0.0,2.2,[["1 viipale",14]],"pekoni bacon","off"],["g:makaronilaatikko","Makaronilaatikko","Valmisruoat",133,7.0,15.0,1.1,4.8,2.4,1.5,0.9,[["1 annos",300]],"laatikko","off"],["g:maksalaatikko","Maksalaatikko","Valmisruoat",175,5.6,23.0,7.3,6.7,0.8,0.3,0.67,[["1 annos",250]],"laatikko","off"],["g:kaalilaatikko","Kaalilaatikko","Valmisruoat",114,4.5,13.0,7.6,4.2,1.8,1.8,0.82,[["1 annos",300]],"laatikko","off"],["g:lasagne","Lasagne","Valmisruoat",158,8.1,11.0,2.9,8.8,2.8,1.4,0.86,[["1 annos",300]],"lasagnette","off"],["g:hernekeitto","Hernekeitto","Valmisruoat",86,4.2,10.0,0.5,2.8,0.5,3.3,1.75,[["1 lautanen (3 dl)",300],["1 purkki",435]],"keitto","off"],["g:lihakeitto","Lihakeitto","Valmisruoat",53,3.9,6.9,1.2,0.9,0.4,1.0,0.9,[["1 lautanen (3 dl)",300]],"keitto","off"],["g:lohikeitto-kalakeitto","Lohikeitto / kalakeitto","Valmisruoat",68,3.1,6.7,0.5,3.0,1.4,0.4,0.66,[["1 lautanen (3 dl)",300]],"keitto","off"],["g:lihapullat","Lihapullat","Valmisruoat",242,13.0,9.1,1.2,17.0,6.4,1.2,1.38,[["1 kpl",15],["1 annos (10 kpl)",150]],"pyörykät","off"],["g:pinaattiohukaiset","Pinaattiohukaiset","Valmisruoat",167,7.0,24.0,2.0,4.0,1.4,3.0,0.79,[["1 kpl",20],["1 annos (6 kpl)",120]],"ohukainen","off"],["g:lihapiirakka","Lihapiirakka","Valmisruoat",267,9.1,35.0,2.9,8.9,2.1,4.7,0.94,[["1 kpl",120]],"piirakka","off"],["g:pakastepizza","Pakastepizza","Valmisruoat",231,9.5,26.0,1.9,9.4,4.8,1.8,1.38,[["1 kokonainen",350],["¼ pizzaa",90]],"pizza","off"],["g:pizza-ravintola","Pizza (ravintola)","Valmisruoat",268,10.4,26.8,3.6,12.3,4.3,2.2,1.12,[["1 kokonainen",450],["1 pala (⅛)",60]],"pizza","usda"],["g:hampurilainen","Hampurilainen","Valmisruoat",263,13.3,27.8,6.0,10.2,3.6,1.8,1.22,[["1 kpl",120]],"burgeri hampurilainen","usda"],["g:ranskalaiset-ravintola","Ranskalaiset (ravintola)","Valmisruoat",312,3.4,37.6,0.3,14.7,2.3,3.8,0.53,[["pieni annos",80],["keskikokoinen annos",115],["iso annos",150]],"ranskanperunat","usda"],["g:kananugetit","Kananugetit","Valmisruoat",271,19.2,16.1,0.4,13.9,2.5,1.2,1.92,[["1 kpl",16],["1 annos (6 kpl)",100]],"nugetit kana","usda"],["g:spagetti-bolognese","Spagetti bolognese","Valmisruoat",90.0,5.0,13.4,2.6,1.0,0.3,1.8,0.59,[["1 annos",350]],"jauhelihakastike spagetti","usda"],["g:hummus","Hummus","Valmisruoat",237,7.8,9.5,0.6,17.8,2.6,5.5,1.06,[["1 rkl",15],["1 dl",100]],"","usda"],["g:maitosuklaa","Maitosuklaa","Herkut ja naposteltavat",535,7.7,56.0,51.5,29.7,18.5,3.4,0.2,[["1 pala",6],["1 rivi",25],["1 levy (200 g)",200]],"suklaa","usda"],["g:tumma-suklaa-7085","Tumma suklaa 70–85 %","Herkut ja naposteltavat",598,7.8,35.0,24.0,42.6,24.5,10.9,0.05,[["1 pala",10],["1 levy (100 g)",100]],"suklaa tumma","usda"],["g:perunalastut","Perunalastut","Herkut ja naposteltavat",514,6.3,55.0,3.6,29.0,2.4,4.9,1.4,[["1 kourallinen",25],["1 pieni pussi",40],["1 iso pussi",275]],"sipsit sipsi chipsit","off"],["g:tortillalastut","Tortillalastut","Herkut ja naposteltavat",472,7.1,62.4,0.8,20.7,2.8,5.4,0.82,[["1 kourallinen",25]],"nachot sipsit","usda"],["g:popcorn","Popcorn","Herkut ja naposteltavat",422,9.6,48.0,0.8,19.0,4.6,10.0,1.9,[["1 l",25],["1 annos",30]],"popparit","off"],["g:irtokarkit-hedelmakarkit","Irtokarkit (hedelmäkarkit)","Herkut ja naposteltavat",396,0.0,98.8,59.0,0.0,0.0,0.1,0.11,[["1 kourallinen",30],["1 kpl",5]],"karkki karkit viinikumi","usda"],["g:salmiakki","Salmiakki","Herkut ja naposteltavat",327,1.6,80.0,56.0,0.5,0.1,0.2,0.42,[["1 kpl",3],["1 kourallinen",30]],"salmiakki lakritsi","off"],["g:lakritsi","Lakritsi","Herkut ja naposteltavat",357,3.5,80.0,63.0,2.2,1.0,2.1,0.49,[["1 patukka",20],["1 kourallinen",30]],"laku","off"],["g:keksit-digestive","Keksit (digestive)","Herkut ja naposteltavat",478,7.2,67.0,28.0,20.0,8.4,1.6,0.69,[["1 kpl",15]],"keksi","off"],["g:suklaakeksit","Suklaakeksit","Herkut ja naposteltavat",492,4.9,66.5,null,22.6,7.8,1.7,0.58,[["1 kpl",15]],"keksi cookie","usda"],["g:pahkinasekoitus","Pähkinäsekoitus","Herkut ja naposteltavat",607,19.5,16.0,5.0,53.5,8.0,6.4,0.01,[["1 kourallinen",30]],"pähkinät","usda"],["g:mysli-valipalapatukka","Mysli-/välipalapatukka","Herkut ja naposteltavat",443,7.4,62.7,null,17.2,7.2,4.6,0.69,[["1 kpl",30]],"patukka välipalapatukka","usda"],["g:proteiinipatukka","Proteiinipatukka","Herkut ja naposteltavat",361,31.1,32.8,7.4,15.2,7.4,3.9,0.33,[["1 kpl",55]],"patukka proteiini","off"],["g:kova-karamelli","Kova karamelli","Herkut ja naposteltavat",394,0.0,98.0,62.9,0.2,0.0,0.0,0.1,[["1 kpl",6]],"karkki","usda"],["g:kahvi-musta","Kahvi, musta","Juomat",1.0,0.1,0.0,0.0,0.0,0.0,0.0,0.01,[["1 kuppi (1,5 dl)",150],["1 muki (2,5 dl)",250]],"kahvi suodatinkahvi","usda"],["g:tee","Tee","Juomat",1.0,0.0,0.3,0.0,0.0,0.0,0.0,0.01,[["1 muki (2,5 dl)",250]],"tee","usda"],["g:vesi","Vesi","Juomat",0,0,0,0,0,0,0,0,[["1 lasi (2 dl)",200],["0,5 l pullo",500]],"vesi","fixed"],["g:appelsiinimehu","Appelsiinimehu","Juomat",45.0,0.7,10.2,8.4,0.2,0.0,0.2,0.0,[["1 lasi (2 dl)",200]],"mehu täysmehu","usda"],["g:omenamehu","Omenamehu","Juomat",46.0,0.1,11.1,9.6,0.1,0.0,0.2,0.01,[["1 lasi (2 dl)",200]],"mehu täysmehu","usda"],["g:virvoitusjuoma-sokerillinen","Virvoitusjuoma, sokerillinen","Juomat",42.0,0.0,10.4,9.9,0.2,0.0,0.0,0.01,[["0,33 l tölkki",330],["0,5 l pullo",500]],"limsa limonadi cola","usda"],["g:virvoitusjuoma-sokeriton","Virvoitusjuoma, sokeriton","Juomat",0.3,0,0,0,0,0,0,0.02,[["0,33 l tölkki",330],["0,5 l pullo",500]],"limsa kevytlimsa zero light","fixed"],["g:energiajuoma","Energiajuoma","Juomat",43.0,0.5,10.2,10.2,0.0,0.0,0.0,0.1,[["0,25 l tölkki",250],["0,5 l tölkki",500]],"energiajuoma","usda"],["g:energiajuoma-sokeriton","Energiajuoma, sokeriton","Juomat",4.0,0.4,0.4,0.0,0.0,0.0,0.0,0.1,[["0,33 l tölkki",330],["0,5 l tölkki",500]],"energiajuoma zero","usda"],["g:kaakao-maitoon","Kaakao maitoon","Juomat",77.0,3.5,9.7,9.7,2.3,1.4,1.0,0.11,[["1 muki (2,5 dl)",250]],"kaakao","usda"],["g:smoothie","Smoothie","Juomat",57,0.6,12.0,11.0,0.2,0.0,1.7,0.01,[["1 lasi (2,5 dl)",250]],"smoothie","off"],["g:proteiinijauhe-hera","Proteiinijauhe (hera)","Juomat",352,78.1,3.1,0.0,1.6,0.8,3.1,0.39,[["1 annos",30]],"proteiini heraproteiini whey","usda"],["g:olut-keskiolut","Olut, keskiolut","Alkoholijuomat",43.0,0.5,3.5,0.0,0.0,0.0,0.0,0.01,[["0,33 l pullo",330],["0,5 l tuoppi",500]],"kalja bisse lager","usda"],["g:olut-kevyt","Olut, kevyt","Alkoholijuomat",29.0,0.2,1.6,0.1,0.0,0.0,0.0,0.01,[["0,33 l pullo",330],["0,5 l tuoppi",500]],"kalja","usda"],["g:alkoholiton-olut","Alkoholiton olut","Alkoholijuomat",20,0.3,4.6,2.4,0.0,0.0,0.0,0.0,[["0,33 l",330],["0,5 l",500]],"olut","off"],["g:punaviini","Punaviini","Alkoholijuomat",85.0,0.1,2.6,0.6,0.0,0.0,0.0,0.01,[["1 lasi (12 cl)",120],["1 pullo (75 cl)",750]],"viini","usda"],["g:valkoviini","Valkoviini","Alkoholijuomat",82.0,0.1,2.6,1.0,0.0,0.0,0.0,0.01,[["1 lasi (12 cl)",120],["1 pullo (75 cl)",750]],"viini","usda"],["g:lonkero","Lonkero","Alkoholijuomat",51,0.0,6.2,6.1,0.0,0.0,0.0,0.0,[["0,33 l",330],["0,5 l",500]],"long drink lonkku","off"],["g:siideri","Siideri","Alkoholijuomat",50,0.0,5.8,5.6,0.0,0.0,1.0,0.0,[["0,33 l",330],["0,5 l",500]],"siideri","off"],["g:viina-40","Viina (40 %)","Alkoholijuomat",231,0.0,0.0,0.0,0.0,0.0,0.0,0.0,[["4 cl",40]],"vodka koskenkorva whisky gin rommi","usda"],["g:voi","Voi","Rasvat, pähkinät ja siemenet",713,0.6,0.8,0.8,80.0,45.0,3.9,1.4,[["1 tl",5],["1 rkl",14],["leivälle",4]],"voi","off"],["g:margariini-levite-60","Margariini / levite 60 %","Rasvat, pähkinät ja siemenet",540,0.0,0.0,0.0,60.0,17.0,0.0,1.0,[["1 tl",5],["leivälle",4]],"levite margariini keiju becel flora","off"],["g:oliivioljy","Oliiviöljy","Rasvat, pähkinät ja siemenet",884,0.0,0.0,0.0,100,13.8,0.0,0.01,[["1 tl",5],["1 rkl",14]],"öljy","usda"],["g:rypsioljy","Rypsiöljy","Rasvat, pähkinät ja siemenet",884,0.0,0.0,0.0,100,7.4,0.0,0.0,[["1 tl",5],["1 rkl",14]],"öljy rapsiöljy","usda"],["g:maapahkinavoi","Maapähkinävoi","Rasvat, pähkinät ja siemenet",598,22.2,17.3,10.5,51.4,10.3,5.0,0.04,[["1 rkl",16],["1 tl",6]],"pähkinävoi","usda"],["g:mantelit","Mantelit","Rasvat, pähkinät ja siemenet",579,21.1,9.1,4.3,49.9,3.8,12.5,0.0,[["1 kourallinen",30],["10 kpl",12]],"manteli","usda"],["g:cashewpahkinat","Cashewpähkinät","Rasvat, pähkinät ja siemenet",553,18.2,26.9,5.9,43.9,7.8,3.3,0.03,[["1 kourallinen",30]],"pähkinät","usda"],["g:saksanpahkinat","Saksanpähkinät","Rasvat, pähkinät ja siemenet",654,15.2,7.0,2.6,65.2,6.1,6.7,0.01,[["1 kourallinen",30]],"pähkinät","usda"],["g:hasselpahkinat","Hasselpähkinät","Rasvat, pähkinät ja siemenet",628,14.9,7.0,4.3,60.8,4.5,9.7,0.0,[["1 kourallinen",30]],"pähkinät","usda"],["g:pistaasipahkinat","Pistaasipähkinät","Rasvat, pähkinät ja siemenet",572,21.1,18.0,7.7,45.8,5.6,10.3,0.01,[["1 kourallinen (kuorittu)",30]],"pähkinät","usda"],["g:maapahkinat","Maapähkinät","Rasvat, pähkinät ja siemenet",587,24.4,12.9,4.9,49.7,7.7,8.4,0.01,[["1 kourallinen",30]],"pähkinät","usda"],["g:auringonkukansiemenet","Auringonkukansiemenet","Rasvat, pähkinät ja siemenet",584,20.8,11.4,2.6,51.5,4.5,8.6,0.02,[["1 rkl",10]],"siemenet","usda"],["g:kurpitsansiemenet","Kurpitsansiemenet","Rasvat, pähkinät ja siemenet",559,30.2,4.7,1.4,49.0,8.7,6.0,0.02,[["1 rkl",10]],"siemenet","usda"],["g:chiansiemenet","Chiansiemenet","Rasvat, pähkinät ja siemenet",486,16.5,7.7,null,30.7,3.3,34.4,0.04,[["1 rkl",12]],"chia siemenet","usda"],["g:pellavansiemenet","Pellavansiemenet","Rasvat, pähkinät ja siemenet",534,18.3,1.6,1.6,42.2,3.7,27.3,0.07,[["1 rkl",10]],"pellava siemenet","usda"],["g:seesaminsiemenet","Seesaminsiemenet","Rasvat, pähkinät ja siemenet",573,17.7,11.6,0.3,49.7,7.0,11.8,0.03,[["1 rkl",9]],"seesami siemenet","usda"],["g:kookoshiutale","Kookoshiutale","Rasvat, pähkinät ja siemenet",660,6.9,7.3,7.3,64.5,57.2,16.3,0.09,[["1 rkl",5]],"kookos","usda"],["g:hunaja","Hunaja","Mausteet, kastikkeet ja muut",304,0.3,82.2,82.1,0.0,0.0,0.2,0.01,[["1 tl",7],["1 rkl",21]],"","usda"],["g:sokeri","Sokeri","Mausteet, kastikkeet ja muut",387,0.0,100.0,99.8,0.0,0.0,0.0,0.0,[["1 tl",4],["1 rkl",13],["1 palasokeri",3]],"hiekkasokeri","usda"],["g:hillo","Hillo","Mausteet, kastikkeet ja muut",278,0.4,67.8,48.5,0.1,0.0,1.1,0.08,[["1 rkl",20],["1 tl",7]],"marmeladi","usda"],["g:ketsuppi","Ketsuppi","Mausteet, kastikkeet ja muut",101,1.0,27.1,21.3,0.1,0.0,0.3,2.27,[["1 rkl",17]],"tomaattiketsuppi","usda"],["g:majoneesi","Majoneesi","Mausteet, kastikkeet ja muut",680,1.0,0.6,0.6,74.8,11.7,0.0,1.59,[["1 rkl",14]],"majoneesi","usda"],["g:sinappi","Sinappi","Mausteet, kastikkeet ja muut",215,5.0,23.9,21.3,10.7,0.6,2.8,2.5,[["1 rkl",15],["1 tl",5]],"sinappi","off"],["g:pesto","Pesto","Mausteet, kastikkeet ja muut",418,9.8,8.3,6.3,37.6,7.1,1.8,1.51,[["1 rkl",15]],"pestokastike","usda"],["g:kaakaojauhe","Kaakaojauhe","Mausteet, kastikkeet ja muut",228,19.6,20.9,1.8,13.7,8.1,37.0,0.05,[["1 rkl",6]],"kaakao","usda"],["g:kaneli","Kaneli","Mausteet, kastikkeet ja muut",247,4.0,27.5,2.2,1.2,0.3,53.1,0.03,[["1 tl",2]],"mauste","usda"]];
@@ -813,11 +823,12 @@ function calcGoals(p) {
   let floored = false;
   if (kcal < floor) { kcal = floor; floored = true; }
   kcal = Math.round(kcal / 10) * 10;
+  const pr = Math.round(Math.max(kcal * 0.2 / 4, p.weight * 1.0));
+  const fat = Math.round(kcal * 0.3 / 9);
+  // Hiilihydraatit täyttävät loput energiasta, jolloin makrot vastaavat kalorimäärää
   return {
     kcal, bmr: Math.round(bmr), tdee: Math.round(tdee), floored, floor,
-    p: Math.round(Math.max(kcal * 0.2 / 4, p.weight * 1.0)),
-    c: Math.round(kcal * 0.5 / 4),
-    f: Math.round(kcal * 0.3 / 9),
+    p: pr, c: Math.max(0, Math.round((kcal - pr * 4 - fat * 9) / 4)), f: fat,
     fi: p.sex === 'm' ? 35 : 25
   };
 }
@@ -990,15 +1001,20 @@ class Writer {
       const job = w.next; w.next = null;
       try { await job.fn(job.data); }
       catch (e) {
-        if (e && e.code === 'unavailable') {
-          await sleep(400 + Math.random() * 900);
+        // Tilapäinen virhe (esim. tietokantayhteys suljettiin taustalla): yritetään kerran uudelleen
+        if (e && e.name === 'QuotaExceededError') this.onError(e);
+        else {
+          await sleep(300 + Math.random() * 600);
           try { await job.fn(job.data); } catch (e2) { this.onError(e2); }
-        } else this.onError(e);
+        }
       }
     }
     w.busy = false;
   }
   idle() { for (const w of this.q.values()) if (w.busy || w.next) return false; return true; }
+  async whenIdle(path) {
+    for (let i = 0; i < 400; i++) { if (path ? !this.pending(path) : this.idle()) return; await sleep(25); }
+  }
 }
 
 // IndexedDB: päiväkirja, omat tuotteet, asetukset ja ladatut tuotteet pysyvät puhelimessa
@@ -1009,15 +1025,16 @@ const IDB = {
       if (!('indexedDB' in window)) { rej(new Error('ei IndexedDB:tä')); return; }
       const r = indexedDB.open('annos', 1);
       r.onupgradeneeded = () => { const d = r.result; for (const n of ['kv', 'days', 'foods', 'products']) if (!d.objectStoreNames.contains(n)) d.createObjectStore(n); };
-      r.onsuccess = () => { this.db = r.result; this.db.onversionchange = () => this.db.close(); res(this.db); };
+      r.onsuccess = () => { const db = r.result; this.db = db; db.onversionchange = () => { db.close(); if (this.db === db) this.db = null; }; db.onclose = () => { if (this.db === db) this.db = null; }; res(db); };
       r.onerror = () => rej(r.error);
       r.onblocked = () => rej(new Error('blocked'));
     });
   },
-  run(store, mode, fn) {
+  async run(store, mode, fn) {
+    if (!this.db) await this.open();
     return new Promise((res, rej) => {
-      if (!this.db) { rej(new Error('ei tietokantaa')); return; }
-      const t = this.db.transaction(store, mode);
+      let t;
+      try { t = this.db.transaction(store, mode); } catch (e) { if (e && e.name === 'InvalidStateError') this.db = null; rej(e); return; }
       let out;
       const req = fn(t.objectStore(store));
       if (req) req.onsuccess = () => { out = req.result; };
@@ -1038,7 +1055,12 @@ const IDB = {
 
 class IdbStore {
   constructor() { this.kind = 'idb'; this.w = new Writer(e => onStoreError(e)); }
-  once(fn, cb) { let alive = true; fn().then(v => { if (alive) cb(v, { fromCache: false }); }).catch(e => onStoreError(e)); return () => { alive = false; }; }
+  once(fn, cb) {
+    let alive = true;
+    const go = n => fn().then(v => { if (alive) cb(v, { fromCache: false }); }).catch(e => { if (alive && n < 2) setTimeout(() => go(n + 1), 400); else if (alive) onStoreError(e, 'read'); });
+    go(0);
+    return () => { alive = false; };
+  }
   watchSettings(cb) { return this.once(() => IDB.get('kv', 'settings').then(v => v || null), cb); }
   watchMeta(cb) { return this.once(() => IDB.get('kv', 'meta').then(v => v || null), cb); }
   watchDay(date, cb) { return this.once(() => IDB.get('days', date).then(v => v || null), cb); }
@@ -1075,12 +1097,13 @@ class LocalStore {
   }
   key(p) { return 'annos:' + p; }
   read(p) {
+    if (this.mem.has(p)) return JSON.parse(this.mem.get(p));
     if (this.ls) { try { const v = this.ls.getItem(this.key(p)); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
-    return this.mem.has(p) ? JSON.parse(this.mem.get(p)) : null;
+    return null;
   }
   put(p, d) {
     const v = JSON.stringify(d);
-    if (this.ls) { try { this.ls.setItem(this.key(p), v); } catch (e) { this.mem.set(p, v); toast('Selaimen tallennustila on täynnä. Vie varmuuskopio asetuksista.'); } }
+    if (this.ls) { try { this.ls.setItem(this.key(p), v); this.mem.delete(p); } catch (e) { this.mem.set(p, v); toast('Selaimen tallennustila on täynnä. Vie varmuuskopio asetuksista.'); } }
     else this.mem.set(p, v);
     this.emit(p);
   }
@@ -1132,13 +1155,12 @@ const S = {
 function emptyDay(date) { return { date, entries: [], water: 0, weight: null, v: 1 }; }
 function curDay() { return S.day && S.day.date === S.date ? S.day : emptyDay(S.date); }
 
-function onStoreError(e, terminal) {
-  const code = e && e.code;
-  if (code === 'quota_exceeded') toast('Tallennustila on täynnä. Poista vanhoja tietoja asetuksista.');
-  else if (code === 'revoked') { S.storeError = 'revoked'; render(); }
-  else if (code === 'resource_exhausted') toast('Liian monta tallennusta kerralla. Odota hetki.');
-  else if (terminal && code === 'unavailable') { S.storeError = 'unavailable'; render(); }
-  else if (code && code !== 'invalid_argument') toast('Tallennus ei onnistunut juuri nyt. Yritä hetken päästä uudelleen.');
+function onStoreError(e, kind) {
+  const name = e && e.name;
+  // Tallennusvirhe näytetään aina, jottei käyttäjä luule muutosta tallentuneeksi
+  if (kind === 'read') toast('Tietojen lukeminen ei onnistunut. Sulje sovellus ja avaa se uudelleen.');
+  else if (name === 'QuotaExceededError') toast('Puhelimen tallennustila on täynnä, joten viimeisin muutos ei tallentunut. Vapauta tilaa tai poista tuotepaketti asetuksista.');
+  else toast('Viimeisin muutos ei tallentunut. Yritä uudelleen. Jos virhe toistuu, sulje sovellus ja avaa se uudelleen.');
   if (window.console) console.warn('Annos store', e);
 }
 
@@ -1153,24 +1175,60 @@ function saveDay(d) {
   render();
 }
 function saveSettings(st) { S.settings = st; S.store.saveSettings(JSON.parse(JSON.stringify(st))); render(); }
-function saveMeta() { S.store.saveMeta(JSON.parse(JSON.stringify(S.meta))); }
+const metaQueue = [];
+function mutateMeta(fn) {
+  if (S.store && S.ready.meta) { fn(S.meta); S.store.saveMeta(JSON.parse(JSON.stringify(S.meta))); }
+  else { fn(S.meta); metaQueue.push(fn); }
+}
+function metaLoaded(data) {
+  S.meta = Object.assign({ recent: [], fav: [] }, data || {});
+  S.ready.meta = true;
+  if (metaQueue.length) { for (const fn of metaQueue.splice(0)) fn(S.meta); S.store.saveMeta(JSON.parse(JSON.stringify(S.meta))); }
+}
 
 function subscribeDay() {
   if (S.unsubDay) { try { S.unsubDay(); } catch (e) { /* */ } }
   S.ready.day = false;
   const date = S.date;
   const path = S.store.dayPath(date);
-  S.unsubDay = S.store.watchDay(date, (data, meta) => {
+  const apply = data => {
     if (S.date !== date) return;
-    if (S.store.isPending(path)) return; // omat tallentamattomat muutokset ovat tuoreempia
     S.day = data ? Object.assign(emptyDay(date), data) : emptyDay(date);
+    if (!Array.isArray(S.day.entries)) S.day.entries = [];
     S.ready.day = true;
+    flushDayQueue();
     render();
+  };
+  S.unsubDay = S.store.watchDay(date, data => {
+    if (S.date !== date) return;
+    if (S.store.isPending(path)) {
+      // Oma tallennus on kesken: luetaan päivä uudelleen, kun se on valmis
+      const reread = () => S.store.w.whenIdle(path).then(() => S.store.getDay(date)).then(d => S.store.isPending(path) ? reread() : apply(d));
+      if (S.store.w) reread().catch(e => onStoreError(e, 'read'));
+      return;
+    }
+    apply(data);
   });
+}
+// Päivän muutokset tehdään vasta, kun päivän tiedot on luettu, jottei mitään kirjoiteta vanhojen päälle
+const dayQueue = [];
+function dayReady() { return S.ready.day && S.day && S.day.date === S.date; }
+function mutateDay(fn) {
+  if (dayReady()) { const d = JSON.parse(JSON.stringify(S.day)); if (fn(d) !== false) saveDay(d); return; }
+  dayQueue.push({ date: S.date, fn });
+}
+function flushDayQueue() {
+  while (dayQueue.length && dayReady()) {
+    const job = dayQueue.shift();
+    if (job.date !== S.date) continue;
+    const d = JSON.parse(JSON.stringify(S.day));
+    if (job.fn(d) !== false) saveDay(d);
+  }
 }
 function setDate(d) {
   if (d === S.date) return;
   prevDayCache.clear();
+  dayQueue.length = 0;
   S.date = d;
   S.day = null;
   subscribeDay();
@@ -1182,17 +1240,16 @@ function itemSnapshot(item) {
 }
 function pushRecent(item, g, por) {
   const k = item.src + ':' + item.ref;
-  const r = (S.meta.recent || []).filter(x => x.src + ':' + x.ref !== k);
-  r.unshift(Object.assign(itemSnapshot(item), { g, pl: por ? por.pl : null, pc: por ? por.pc : null, pu: por ? por.pu : null, t: Date.now() }));
-  S.meta.recent = r.slice(0, 40);
-  saveMeta();
+  const snap = Object.assign(itemSnapshot(item), { g, pl: por ? por.pl : null, pc: por ? por.pc : null, pu: por ? por.pu : null, t: Date.now() });
+  mutateMeta(m => { const r = (m.recent || []).filter(x => x.src + ':' + x.ref !== k); r.unshift(snap); m.recent = r.slice(0, 40); });
 }
 function isFav(item) { return (S.meta.fav || []).some(x => x.src === item.src && x.ref === item.ref); }
 function toggleFav(item) {
-  const f = S.meta.fav || [];
-  if (isFav(item)) S.meta.fav = f.filter(x => !(x.src === item.src && x.ref === item.ref));
-  else S.meta.fav = [itemSnapshot(item)].concat(f).slice(0, 300);
-  saveMeta();
+  const on = !isFav(item), snap = itemSnapshot(item);
+  mutateMeta(m => {
+    const f = (m.fav || []).filter(x => !(x.src === item.src && x.ref === item.ref));
+    m.fav = on ? [snap].concat(f).slice(0, 300) : f;
+  });
 }
 function snapToItem(x) {
   // Haetaan tuorein tieto, jos se on saatavilla
@@ -1202,14 +1259,12 @@ function snapToItem(x) {
 }
 
 function addEntry(item, g, meal, por) {
-  const d = JSON.parse(JSON.stringify(curDay()));
   const e = { id: rid(), m: meal, n: item.n, b: item.b || '', src: item.src, ref: item.ref || null, g: Math.round(g * 10) / 10,
     pl: por ? por.pl : null, pc: por ? por.pc : null, pu: por ? por.pu : null, per: item.per, t: Date.now() };
-  d.entries.push(e);
-  saveDay(d);
+  const date = S.date;
+  mutateDay(d => { d.entries.push(Object.assign({}, e)); });
   if (item.src !== 'quick' && item.src !== 'ai') pushRecent(item, g, por);
-  e.date = d.date;
-  return e;
+  return Object.assign({ date }, e);
 }
 
 /* =========================================================================
@@ -1217,7 +1272,8 @@ function addEntry(item, g, meal, por) {
    ========================================================================= */
 let appEl, viewEl, navEl, sheetsEl;
 function buildShell() {
-  document.body.innerHTML = '';
+  // Skriptit jäävät paikalleen: kameran varalukija (ZXing) luetaan sivulta myös ilman verkkoa
+  for (const n of [...document.body.childNodes]) if (n.nodeName !== 'SCRIPT') n.remove();
   appEl = h('div', { class: 'app' });
   viewEl = h('main', { class: 'view', id: 'view' });
   appEl.appendChild(viewEl);
@@ -1225,7 +1281,7 @@ function buildShell() {
   sheetsEl = h('div', { id: 'sheets' });
   document.body.append(appEl, navEl, sheetsEl);
   renderNav();
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTopSheet(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !S.scannerStop) closeTopSheet(); });
 }
 function renderNav() {
   navEl.innerHTML = '';
@@ -1288,14 +1344,19 @@ function renderDayView(root) {
   root.appendChild(h('header', { class: 'topbar' },
     h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Edellinen päivä', onclick: () => setDate(addDays(S.date, -1)) }, icon('left')),
     h('div', { class: 'title' },
-      h('label', { class: 'date-btn', for: 'datepick' },
+      h('button', { class: 'date-btn', type: 'button', 'aria-label': 'Valitse päivä, nyt ' + dateSub(S.date), onclick: () => {
+        const dp = document.getElementById('datepick');
+        try { if (dp.showPicker) { dp.showPicker(); return; } } catch (e) { /* */ }
+        dp.focus(); dp.click();
+      } },
         h('span', { class: 'd1' }, dateTitle(S.date)),
         h('span', { class: 'd2' }, dateSub(S.date))),
-      h('input', { type: 'date', id: 'datepick', class: 'sr', value: S.date, onchange: e => e.target.value && setDate(e.target.value) })),
+      h('input', { type: 'date', id: 'datepick', class: 'sr', tabindex: '-1', 'aria-hidden': 'true', value: S.date, onchange: e => /^\d{4}-\d\d-\d\d$/.test(e.target.value) && setDate(e.target.value) })),
     h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Seuraava päivä', onclick: () => setDate(addDays(S.date, 1)) }, icon('right'))
   ));
   const bn = storeBanner(); if (bn) root.appendChild(bn);
   const op = offlinePill(); if (op) root.appendChild(op);
+  const uc = updateCard(); if (uc) root.appendChild(uc);
   const ic = installCard(); if (ic) root.appendChild(ic);
   if (S.date !== todayIso()) root.appendChild(h('button', { class: 'link-btn', type: 'button', style: { alignSelf: 'center', marginTop: '-10px' }, onclick: () => setDate(todayIso()) }, 'Palaa tähän päivään'));
 
@@ -1404,11 +1465,10 @@ async function prevMealEntries(mk) {
 }
 async function copyMeal(m, btn) {
   btn.disabled = true;
+  const date = S.date;
   const prev = await prevMealEntries(m.k);
-  if (!prev.length) return;
-  const d = JSON.parse(JSON.stringify(curDay()));
-  for (const e of prev) d.entries.push(Object.assign({}, e, { id: rid(), t: Date.now() }));
-  saveDay(d);
+  if (!prev.length || S.date !== date) return;
+  mutateDay(d => { for (const e of prev) d.entries.push(Object.assign({}, e, { id: rid(), t: Date.now() })); });
   toast(prev.length + ' ruokaa kopioitu ' + m.ill);
 }
 
@@ -1424,9 +1484,7 @@ function waterTile(d, g) {
       s('path', { class: 'fillp', d: 'M5.6 10h14.8l-1.6 18.2a2 2 0 0 1-2 1.8H9.2a2 2 0 0 1-2-1.8z' }),
       s('path', { class: 'outl', d: 'M3.5 3h19l-2.2 25.2a2 2 0 0 1-2 1.8H7.7a2 2 0 0 1-2-1.8z' }));
     row.appendChild(h('button', { class: 'glass' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false', 'aria-label': (i + 1) + '. lasi', onclick: () => {
-      const dd = JSON.parse(JSON.stringify(curDay()));
-      dd.water = (i + 1 === have ? i : i + 1) * per;
-      saveDay(dd);
+      mutateDay(dd => { const hv = Math.round((dd.water || 0) / per); dd.water = (i + 1 === hv ? i : i + 1) * per; });
     } }, svg));
   }
   return h('div', { class: 'tile' },
@@ -1449,14 +1507,15 @@ function openWeight() {
   sh.body.append(h('div', { class: 'field' }, h('label', { for: 'wkg' }, 'Paino (kg)'), inp), err);
   const save = h('button', { class: 'btn primary wide', type: 'button', onclick: () => {
     const v = parseNum(inp.value);
-    if (inp.value.trim() === '') { const dd = JSON.parse(JSON.stringify(curDay())); dd.weight = null; saveDay(dd); sh.close(); return; }
+    if (inp.value.trim() === '') { mutateDay(dd => { dd.weight = null; }); sh.close(); return; }
     if (!(v > 20 && v < 400)) { err.textContent = 'Anna paino kilogrammoina, esimerkiksi 78,5.'; return; }
-    const dd = JSON.parse(JSON.stringify(curDay())); dd.weight = Math.round(v * 10) / 10; saveDay(dd);
-    if (S.settings) { const st = JSON.parse(JSON.stringify(S.settings)); st.profile = Object.assign({}, st.profile, { weight: dd.weight }); saveSettings(st); }
+    const w = Math.round(v * 10) / 10;
+    mutateDay(dd => { dd.weight = w; });
+    if (S.settings && S.date === todayIso()) { const st = JSON.parse(JSON.stringify(S.settings)); st.profile = Object.assign({}, st.profile, { weight: w }); saveSettings(st); }
     sh.close();
   } }, 'Tallenna paino');
   sh.foot.append(save);
-  if (d.weight != null) sh.foot.append(h('button', { class: 'btn plain wide', type: 'button', onclick: () => { const dd = JSON.parse(JSON.stringify(curDay())); dd.weight = null; saveDay(dd); sh.close(); } }, 'Poista merkintä'));
+  if (d.weight != null) sh.foot.append(h('button', { class: 'btn plain wide', type: 'button', onclick: () => { mutateDay(dd => { dd.weight = null; }); sh.close(); } }, 'Poista merkintä'));
   setTimeout(() => inp.focus(), 50);
 }
 
@@ -1464,28 +1523,59 @@ function openWeight() {
    Arkit (bottom sheet) ja ilmoitukset
    ========================================================================= */
 const sheetStack = [];
+let sheetSeq = 0;
+/* Puhelimen takaisin-ele sulkee päällimmäisen arkin tai kameran eikä koko sovellusta.
+   Avoimille arkeille on historiassa aina vain yksi lisämerkintä, joten historia ei voi mennä sekaisin. */
+const Hist = {
+  expect: false,
+  overlays() { return sheetStack.length + (S.scannerStop ? 1 : 0); },
+  onOverlay() { return !!(history.state && history.state.annosOverlay); },
+  acquire() {
+    if (this.expect || this.onOverlay()) return;
+    try { history.pushState({ annosOverlay: 1 }, ''); } catch (e) { /* */ }
+  },
+  release() {
+    if (this.overlays() || this.expect || !this.onOverlay()) return;
+    this.expect = true;
+    try { history.back(); } catch (e) { this.expect = false; }
+  }
+};
+window.addEventListener('popstate', () => {
+  if (Hist.expect) { Hist.expect = false; if (Hist.overlays()) Hist.acquire(); return; }
+  if (Hist.onOverlay()) return; // eteenpäin-siirtymä: merkintä käytetään seuraavalle arkille
+  if (S.scannerStop) S.scannerStop(true);
+  else {
+    const t = sheetStack[sheetStack.length - 1];
+    if (t && !t.modal) t.close(true);
+  }
+  if (Hist.overlays()) Hist.acquire();
+});
 function sheet(opts) {
   const ov = h('div', { class: 'overlay' + (opts.center ? ' center' : ''), onclick: e => { if (e.target === ov && !opts.modal) close(); } });
   const head = h('div', { class: 'sheet-head' },
     opts.back ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Takaisin', onclick: () => close() }, icon('left')) : h('span'),
-    h('h2', { id: 'sh-' + sheetStack.length }, opts.title || ''),
+    h('h2', { id: 'sh-' + (++sheetSeq) }, opts.title || ''),
     opts.modal ? h('span') : h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Sulje', onclick: () => opts.closeAll ? closeAllSheets() : close() }, icon('close')));
   const body = h('div', { class: 'sheet-body' });
   const foot = h('div', { class: 'sheet-foot' });
-  const box = h('div', { class: 'sheet' + (opts.full ? ' full' : '') + (opts.center ? ' dialog' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sh-' + sheetStack.length }, head, body, foot);
+  const box = h('div', { class: 'sheet' + (opts.full ? ' full' : '') + (opts.center ? ' dialog' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'sh-' + sheetSeq }, head, body, foot);
   ov.appendChild(box);
   sheetsEl.appendChild(ov);
   document.body.style.overflow = 'hidden';
+  const opener = document.activeElement;
   const api = { el: ov, box, head, body, foot, title: head.querySelector('h2'), onClose: opts.onClose || null, modal: !!opts.modal, close };
-  function close() {
+  function close(fromPop) {
     const i = sheetStack.indexOf(api);
     if (i < 0) return;
     sheetStack.splice(i, 1);
     ov.remove();
     if (!sheetStack.length) document.body.style.overflow = '';
+    if (fromPop !== true) Hist.release();
+    if (opener && opener.isConnected && typeof opener.focus === 'function') { try { opener.focus({ preventScroll: true }); } catch (e) { /* */ } }
     if (api.onClose) api.onClose();
   }
   sheetStack.push(api);
+  Hist.acquire();
   setTimeout(() => { const f = box.querySelector('[autofocus]'); if (f) f.focus(); }, 30);
   return api;
 }
@@ -1497,7 +1587,7 @@ function toast(msg, actionLabel, action) {
   if (toastEl) toastEl.remove();
   clearTimeout(toastT);
   toastEl = h('div', { class: 'toast', role: 'status' }, h('span', null, msg),
-    actionLabel ? h('button', { type: 'button', onclick: () => { action(); toastEl.remove(); toastEl = null; } }, actionLabel) : null);
+    actionLabel ? h('button', { type: 'button', onclick: () => { const el = toastEl; if (el) { el.remove(); toastEl = null; } action(); } }, actionLabel) : null);
   document.body.appendChild(toastEl);
   toastT = setTimeout(() => { if (toastEl) { toastEl.remove(); toastEl = null; } }, actionLabel ? 5500 : 3500);
 }
@@ -1700,20 +1790,25 @@ function resolveCode(code, onItem) {
   sh.foot.remove();
   const status = h('div', { class: 'busy' }, h('div', { class: 'spinner' }), h('p', null, 'Haetaan tuotetta…'));
   sh.body.append(status);
+  let closed = false;
+  sh.onClose = () => { closed = true; };
   findByCode(code).then(item => {
-    if (item) { sh.close(); onItem(item); }
+    if (closed) return;
+    if (item) { sh.onClose = null; sh.close(); onItem(item); }
     else status.replaceWith(notFoundBox(code, it => { sh.close(); onItem(it); }));
-  }).catch(() => status.replaceWith(h('div', { class: 'empty' }, h('p', null, 'Tuotetietoja ei saatu luettua. Yritä uudelleen.'))));
+  }).catch(() => !closed && status.replaceWith(h('div', { class: 'empty' }, h('p', null, 'Tuotetietoja ei saatu luettua. Yritä uudelleen.'))));
 }
 
 function scanFromFile(file, onItem) {
   const sh = sheet({ title: 'Viivakoodi kuvasta', small: true });
   sh.foot.remove();
   const url = URL.createObjectURL(file);
-  sh.onClose = () => URL.revokeObjectURL(url);
+  let closed = false;
+  sh.onClose = () => { closed = true; URL.revokeObjectURL(url); };
   const status = h('div', { class: 'busy' }, h('div', { class: 'spinner' }), h('p', null, 'Luetaan viivakoodia…'));
   sh.body.append(h('img', { class: 'preview-img', src: url, alt: 'Otettu kuva' }), status);
-  window.AnnosScanner.decodeFile(file).then(res => {
+  window.AnnosScanner.decodeFile(file, { cancelled: () => closed }).then(res => {
+    if (closed) return;
     if (!res) {
       status.replaceWith(h('div', { class: 'empty' },
         h('p', null, h('strong', null, 'Viivakoodia ei tunnistettu')),
@@ -1726,6 +1821,7 @@ function scanFromFile(file, onItem) {
     sh.close();
     resolveCode(res.code, onItem);
   }).catch(() => {
+    if (closed) return;
     status.replaceWith(h('div', { class: 'empty' }, h('p', null, 'Kuvaa ei voitu lukea. Kokeile toista kuvaa tai kirjoita viivakoodin numerot.'),
       h('button', { class: 'btn secondary', type: 'button', onclick: () => { sh.close(); openManualCode(onItem); } }, 'Kirjoita numerot')));
   });
@@ -1740,6 +1836,7 @@ function pickPhoto(cb, capture) {
 // Suora kameraskannaus: selaimen oma tunnistin (Android Chrome) tai ZXing
 function openScanner(onItem) {
   if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { pickPhoto(f => scanFromFile(f, onItem)); return; }
+  if (S.scannerStop) return; // skanneri on jo auki
   const video = h('video', { playsinline: true, muted: true, autoplay: true, 'aria-hidden': 'true' });
   video.muted = true;
   const frame = h('div', { class: 'scan-frame' }, h('i', { class: 'c tl' }), h('i', { class: 'c tr' }), h('i', { class: 'c bl' }), h('i', { class: 'c br' }), h('div', { class: 'scan-line' }));
@@ -1749,28 +1846,32 @@ function openScanner(onItem) {
   const ov = h('div', { class: 'scanner', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Viivakoodin skannaus' },
     video, h('div', { class: 'scan-top' }, closeBtn, h('span', { class: 'scan-title' }, 'Skannaa viivakoodi'), torchBtn), frame, hint,
     h('div', { class: 'scan-bottom' },
-      h('button', { class: 'scan-pill', type: 'button', onclick: () => { stop(); pickPhoto(f => scanFromFile(f, onItem)); } }, icon('camera'), 'Ota kuva'),
+      h('button', { class: 'scan-pill', type: 'button', onclick: () => { pickPhoto(f => scanFromFile(f, onItem)); stop(); } }, icon('camera'), 'Ota kuva'),
       h('button', { class: 'scan-pill', type: 'button', onclick: () => { stop(); openManualCode(onItem); } }, icon('edit'), 'Kirjoita numerot')));
   document.body.appendChild(ov);
   let stream = null, stopped = false, timer = null, last = null, lastT = 0;
   const onVis = () => { if (document.hidden) stop(); };
-  const onKey = e => { if (e.key === 'Escape') stop(); };
-  function stop() {
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); stop(); } };
+  function stop(fromPop) {
     if (stopped) return;
     stopped = true; clearTimeout(timer);
     if (stream) stream.getTracks().forEach(t => t.stop());
     ov.remove();
+    S.scannerStop = null;
     document.removeEventListener('visibilitychange', onVis);
     document.removeEventListener('keydown', onKey, true);
+    if (fromPop !== true) Hist.release();
   }
+  S.scannerStop = stop;
+  Hist.acquire();
   document.addEventListener('visibilitychange', onVis);
   document.addEventListener('keydown', onKey, true);
-  closeBtn.onclick = stop;
+  closeBtn.onclick = () => stop();
   function found(code) {
     if (navigator.vibrate) try { navigator.vibrate(50); } catch (e) { /* */ }
     frame.classList.add('ok');
     hint.textContent = 'Viivakoodi ' + code;
-    setTimeout(() => { stop(); resolveCode(code, onItem); }, 250);
+    setTimeout(() => { if (stopped) return; stop(); resolveCode(code, onItem); }, 250);
   }
   (async () => {
     try {
@@ -1836,6 +1937,8 @@ function openManualCode(onItem) {
   const inp = h('input', { class: 'input', id: 'mcode', inputmode: 'numeric', placeholder: 'esim. 6408430000654', autocomplete: 'off', autofocus: true });
   const msg = h('div');
   sh.body.append(h('div', { class: 'field' }, h('label', { for: 'mcode' }, 'Viivakoodin numerot (8–14 numeroa)'), inp), msg);
+  let closed = false;
+  sh.onClose = () => { closed = true; };
   const go = async () => {
     const c = inp.value.replace(/\D/g, '');
     msg.innerHTML = '';
@@ -1843,9 +1946,10 @@ function openManualCode(onItem) {
     if (window.AnnosScanner && !window.AnnosScanner.validGtin(c)) msg.appendChild(h('p', { class: 'hint' }, 'Tarkistusnumero ei täsmää. Haetaan silti.'));
     try {
       const item = await findByCode(c);
+      if (closed) return;
       if (item) { sh.close(); onItem(item); }
       else { msg.innerHTML = ''; msg.appendChild(notFoundBox(c, it => { sh.close(); onItem(it); })); }
-    } catch (e) { msg.appendChild(h('p', { class: 'err' }, 'Tuotetietoja ei saatu ladattua. Tarkista verkkoyhteys.')); }
+    } catch (e) { if (!closed) msg.appendChild(h('p', { class: 'err' }, 'Tuotetietoja ei saatu ladattua. Tarkista verkkoyhteys.')); }
   };
   inp.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
   sh.foot.append(h('button', { class: 'btn primary wide', type: 'button', onclick: go }, 'Hae tuote'));
@@ -1982,10 +2086,11 @@ function openFood(item, opts) {
     const n = parseNum(amountIn.value);
     const por = unit.l === 'g' ? null : { pl: portionLabel(unit, n), pc: n, pu: unit.l };
     if (editing) {
-      const d = JSON.parse(JSON.stringify(curDay()));
-      const e = d.entries.find(x => x.id === editing.id);
-      if (e) { e.g = Math.round(g * 10) / 10; e.pl = por ? por.pl : null; e.pc = por ? por.pc : null; e.pu = por ? por.pu : null; e.m = meal; }
-      saveDay(d);
+      mutateDay(d => {
+        const e = d.entries.find(x => x.id === editing.id);
+        if (!e) return false;
+        e.g = Math.round(g * 10) / 10; e.pl = por ? por.pl : null; e.pc = por ? por.pc : null; e.pu = por ? por.pu : null; e.m = meal;
+      });
       sh.close();
       return;
     }
@@ -2011,12 +2116,17 @@ function openEntry(e) {
 }
 function removeEntry(id, silent, date) {
   if (date && date !== S.date) { toast('Kumoaminen onnistuu vain samana päivänä näkymässä.'); return; }
-  const d = JSON.parse(JSON.stringify(curDay()));
-  const i = d.entries.findIndex(x => x.id === id);
-  if (i < 0) return;
-  const [gone] = d.entries.splice(i, 1);
-  saveDay(d);
-  if (!silent) toast('Poistettu: ' + gone.n, 'Kumoa', () => { const dd = JSON.parse(JSON.stringify(curDay())); dd.entries.splice(i, 0, gone); saveDay(dd); });
+  const day = S.date;
+  let gone = null, at = -1;
+  mutateDay(d => {
+    at = d.entries.findIndex(x => x.id === id);
+    if (at < 0) return false;
+    gone = d.entries.splice(at, 1)[0];
+  });
+  if (!silent && gone) toast('Poistettu: ' + gone.n, 'Kumoa', () => {
+    if (S.date !== day) { toast('Kumoaminen onnistuu vain samana päivänä näkymässä.'); return; }
+    mutateDay(dd => { if (dd.entries.some(x => x.id === gone.id)) return false; dd.entries.splice(Math.min(at, dd.entries.length), 0, gone); });
+  });
 }
 
 /* ---------- Pikalisäys ---------- */
@@ -2041,10 +2151,8 @@ function openQuick(getMeal, done, entry) {
     const num = id => { const v = parseNum($(id, sh.box).value); return isFinite(v) && v >= 0 ? v : null; };
     const item = { src: 'quick', ref: null, n: $('#qn', sh.box).value.trim() || 'Pikalisäys', b: '', per: { kcal, p: num('#qp'), c: num('#qc'), s: null, f: num('#qf'), sf: null, fi: null, sa: null } };
     if (entry) {
-      const d = JSON.parse(JSON.stringify(curDay()));
-      const e = d.entries.find(x => x.id === entry.id);
-      if (e) { e.n = item.n; e.per = item.per; e.g = 100; e.m = meal; }
-      saveDay(d); sh.close(); return;
+      mutateDay(d => { const e = d.entries.find(x => x.id === entry.id); if (!e) return false; e.n = item.n; e.per = item.per; e.g = 100; e.m = meal; });
+      sh.close(); return;
     }
     const e = addEntry(item, 100, meal, null);
     toast('Lisätty ' + MEAL[meal].ill, 'Kumoa', () => removeEntry(e.id, true, e.date));
@@ -2063,6 +2171,7 @@ function aiErrorText(e) {
   if (c === 'image_rejected') return 'Kuvaa ei voitu käyttää. Kokeile toista kuvaa (JPEG tai PNG).';
   if (c === 'refused') return 'Tekoäly ei vastannut tähän. Muotoile kuvaus toisin.';
   if (c === 'invalid_json' || c === 'empty_completion') return 'Vastaus jäi vajaaksi. Yritä uudelleen tai kuvaile lyhyemmin.';
+  if (c === 'truncated') return 'Vastaus jäi kesken, koska siitä tuli liian pitkä. Kuvaile lyhyemmin tai lisää ateria osissa.';
   if (c === 'cancelled') return '';
   if (c === 'bad_key') return 'API-avain ei kelpaa. Tarkista se asetuksista kohdasta Tekoäly.';
   if (c === 'no_credit') return 'API-tilillä ei ole saldoa. Lisää saldoa Claude Consolessa.';
@@ -2175,16 +2284,14 @@ function openDescribe(getMeal, done) {
     out.append(list, h('p', null, total));
     addBtn.onclick = () => {
       const meal = getMeal();
-      const d = JSON.parse(JSON.stringify(curDay()));
-      let n = 0;
+      const add = [];
       for (const it of items) {
         if (!it.on || !(it.grams > 0)) continue;
-        const src = it.gen ? 'gen' : 'ai';
-        d.entries.push({ id: rid(), m: meal, n: it.name, b: '', src, ref: it.gen ? it.gen.ref : null, g: Math.round(it.grams * 10) / 10, pl: null, pc: null, per: it.per, t: Date.now() });
+        add.push({ id: rid(), m: meal, n: it.name, b: '', src: it.gen ? 'gen' : 'ai', ref: it.gen ? it.gen.ref : null, g: Math.round(it.grams * 10) / 10, pl: null, pc: null, per: it.per, t: Date.now() });
         if (it.gen) pushRecent(it.gen, it.grams, null);
-        n++;
       }
-      saveDay(d);
+      const n = add.length;
+      mutateDay(d => { for (const e of add) d.entries.push(e); });
       toast(n + ' ruokaa lisätty ' + MEAL[meal].ill);
       closeAllSheets();
     };
@@ -2300,9 +2407,10 @@ function upsertFood(f) {
 }
 async function deleteFood(id) {
   S.foods = S.foods.filter(x => x.id !== id);
-  S.meta.fav = (S.meta.fav || []).filter(x => !(x.src === 'my' && x.ref === id));
-  S.meta.recent = (S.meta.recent || []).filter(x => !(x.src === 'my' && x.ref === id));
-  saveMeta();
+  mutateMeta(m => {
+    m.fav = (m.fav || []).filter(x => !(x.src === 'my' && x.ref === id));
+    m.recent = (m.recent || []).filter(x => !(x.src === 'my' && x.ref === id));
+  });
   try { await S.store.deleteFood(id); } catch (e) { onStoreError(e); }
   render();
 }
@@ -2390,7 +2498,7 @@ function renderMine(root) {
     const g = h('div', { class: 'group' });
     for (const f of list) {
       g.appendChild(h('button', { class: 'gitem', type: 'button', onclick: () => f.kind === 'recipe' ? openRecipe(f) : openCustomFood(f) },
-        h('div', null, h('div', { style: { fontWeight: '550' } }, f.name), h('div', { class: 'gs' }, [f.brand, f.code ? 'viivakoodi ' + f.code : '', f.kind === 'recipe' ? (f.servings + ' annosta, ' + fkcal(f.per.kcal * f.portions[0][1] / 100) + ' kcal/annos') : ''].filter(Boolean).join(', '))),
+        h('div', null, h('div', { style: { fontWeight: '550' } }, f.name), h('div', { class: 'gs' }, [f.brand, f.code ? 'viivakoodi ' + f.code : '', f.kind === 'recipe' && f.portions && f.portions[0] ? (f.servings + ' annosta, ' + fkcal(f.per.kcal * f.portions[0][1] / 100) + ' kcal/annos') : ''].filter(Boolean).join(', '))),
         h('span', { class: 'gv' }, fkcal(f.per && f.per.kcal) + ' kcal/100 g')));
     }
     root.appendChild(g);
@@ -2422,7 +2530,7 @@ function renderStats(root) {
     const merge = list => { const m = new Map(list.map(d => [d.date, d])); if (S.day) m.set(S.day.date, Object.assign({}, S.day, { tot: sumEntries(S.day.entries) })); return m; };
     S.statsCache = { key, days: { range: merge(days), year: merge(wdays) } };
     if (S.view === 'tilastot') render();
-  }).catch(e => { box.innerHTML = ''; box.appendChild(h('div', { class: 'empty' }, h('p', null, 'Tilastoja ei saatu ladattua. Yritä hetken päästä uudelleen.'))); onStoreError(e); });
+  }).catch(e => { box.innerHTML = ''; box.appendChild(h('div', { class: 'empty' }, h('p', null, 'Tilastoja ei saatu ladattua. Yritä hetken päästä uudelleen.'))); onStoreError(e, 'read'); });
 }
 function drawStats(box, days, from, to, range) {
   const g = goalsOf(S.settings);
@@ -2442,10 +2550,10 @@ function drawStats(box, days, from, to, range) {
     return;
   }
   const avgK = avg('kcal');
-  const diffK = avgK - g.kcal;
+  const diffK = Math.round(avgK - g.kcal);
   box.appendChild(h('div', { class: 'kpis' },
     h('div', { class: 'kpi' }, h('span', { class: 'kv' }, fkcal(avgK)), h('span', { class: 'kl' }, 'kcal päivässä keskimäärin')),
-    h('div', { class: 'kpi' }, h('span', { class: 'kv' }, (diffK > 0 ? '+' : diffK < 0 ? '−' : '') + fkcal(Math.abs(diffK))), h('span', { class: 'kl' }, 'kcal päivässä ' + (diffK > 0 ? 'yli' : 'alle') + ' tavoitteen')),
+    h('div', { class: 'kpi' }, h('span', { class: 'kv' }, (diffK > 0 ? '+' : diffK < 0 ? '−' : '') + fkcal(Math.abs(diffK))), h('span', { class: 'kl' }, diffK === 0 ? 'kcal tavoitteesta, osuit tavoitteeseen' : 'kcal päivässä ' + (diffK > 0 ? 'yli' : 'alle') + ' tavoitteen')),
     h('div', { class: 'kpi' }, h('span', { class: 'kv' }, logged.length + '/' + range), h('span', { class: 'kl' }, 'päivää kirjattu' + (streak > 1 ? ', putki ' + streak + ' pv' : '')))));
 
   // Energia päivittäin
@@ -2551,7 +2659,7 @@ function weightCard(box, year, to) {
   });
   svg.appendChild(s('text', { x: padL, y: H - 6 }, shortDate(pts[0].d)));
   svg.appendChild(s('text', { x: W - padR, y: H - 6, 'text-anchor': 'end' }, shortDate(pts[pts.length - 1].d)));
-  const diff = pts[pts.length - 1].w - pts[0].w;
+  const diff = Math.round((pts[pts.length - 1].w - pts[0].w) * 10) / 10;
   card.append(svg, tip, h('p', { class: 'hint' }, 'Muutos ' + shortDate(pts[0].d) + ' alkaen: ' + (diff > 0 ? '+' : diff < 0 ? '−' : '') + fmt(Math.abs(diff), 1) + ' kg.'));
   box.appendChild(card);
   void to;
@@ -2586,15 +2694,19 @@ function renderSettings(root) {
   const fullInfo = h('div', null, h('div', null, 'Kaikki muut tuotteet'),
     h('div', { class: 'gs' }, full ? fmt(S.prodstate.count, 0) + ' tuotetta ladattu ' + new Date(S.prodstate.at).toLocaleDateString('fi-FI') + (S.prodstate.full !== DATA_VERSION ? '. Uudempi versio on saatavilla.' : '.')
       : 'Noin 238 000 tuotetta Pohjoismaista, Baltiasta, Lidliltä ja maailmalta. Lataus on noin ' + FULL_PACK.approxMb + ' Mt, joten käytä wifiä.'));
-  const prog = h('div', { class: 'progress', hidden: true }, h('i'));
-  const progTxt = h('p', { class: 'gs', hidden: true });
+  const prog = h('div', { class: 'progress', id: 'dl-prog', hidden: true }, h('i'));
+  const progTxt = h('p', { class: 'gs', id: 'dl-prog-t', hidden: true });
   const fullBtns = h('div', { class: 'btn-row' });
+  const showProg = () => { fullBtns.hidden = true; prog.hidden = false; progTxt.hidden = false; progTxt.textContent = S.dlProgress ? S.dlProgress.t + ' ' + Math.round(S.dlProgress.f * 100) + ' %' : ''; prog.firstChild.style.width = (S.dlProgress ? S.dlProgress.f * 100 : 0) + '%'; };
   const startDl = async () => {
-    fullBtns.hidden = true; prog.hidden = false; progTxt.hidden = false;
+    if (S.dlProgress) return;
+    S.dlProgress = { t: 'Aloitetaan…', f: 0 };
+    showProg();
     try {
-      await downloadFullPack((t, f) => { progTxt.textContent = t + ' ' + Math.round(f * 100) + ' %'; prog.firstChild.style.width = (f * 100) + '%'; });
+      await downloadFullPack((t, f) => { S.dlProgress = { t, f }; const pt = document.getElementById('dl-prog-t'), pb = document.getElementById('dl-prog'); if (pt) pt.textContent = t + ' ' + Math.round(f * 100) + ' %'; if (pb) pb.firstChild.style.width = (f * 100) + '%'; });
       toast('Kaikki tuotteet ladattu puhelimeen');
     } catch (e) { toast(navigator.onLine ? 'Lataus keskeytyi. Yritä uudelleen.' : 'Lataus vaatii verkkoyhteyden.'); }
+    S.dlProgress = null;
     render();
   };
   if (!full || S.prodstate.full !== DATA_VERSION) fullBtns.append(h('button', { class: 'btn primary', type: 'button', onclick: startDl }, icon('download'), full ? 'Päivitä tuotteet' : 'Lataa kaikki tuotteet'));
@@ -2603,6 +2715,7 @@ function renderSettings(root) {
     await IDB.clear('products'); await IDB.del('kv', 'prodstate'); S.prodstate = null; toast('Tuotepaketti poistettu'); render();
   } }, 'Poista paketti'));
   fullRow.append(fullInfo, prog, progTxt, fullBtns);
+  if (S.dlProgress) showProg();
   pg.append(fullRow);
   pg.append(h('div', { class: 'gitem' }, h('div', null, h('div', null, 'Haku verkosta'), h('div', { class: 'gs' }, 'Jos viivakoodia ei löydy puhelimesta ja verkko on käytössä, tuote haetaan Open Food Factsista ja tallennetaan puhelimeen.')), h('span', { class: 'ok-ico' }, icon('check'))));
   root.appendChild(pg);
@@ -2614,7 +2727,7 @@ function renderSettings(root) {
     ag.append(h('div', { class: 'gitem' }, h('div', null, h('div', null, 'Käytössä'), h('div', { class: 'gs' }, 'Avain …' + S.aiKey.slice(-4) + '. Kuvaile ateria ja ravintoarvojen luku kuvasta ovat käytössä.')), h('span', { class: 'ok-ico' }, icon('check'))));
     ag.append(h('div', { class: 'gitem', style: { gridTemplateColumns: '1fr' } }, h('div', { class: 'btn-row' },
       h('button', { class: 'btn secondary', type: 'button', onclick: testAiKey }, 'Testaa avain'),
-      h('button', { class: 'btn plain', type: 'button', onclick: async () => { await IDB.del('kv', 'aikey'); setAiKey(null); toast('API-avain poistettu'); render(); } }, 'Poista avain'))));
+      h('button', { class: 'btn plain', type: 'button', onclick: async () => { try { await IDB.del('kv', 'aikey'); } catch (e) { /* */ } setAiKey(null); toast('API-avain poistettu'); render(); } }, 'Poista avain'))));
   } else {
     const kin = h('input', { class: 'input', id: 'aikey', type: 'password', autocomplete: 'off', placeholder: 'sk-ant-…', 'aria-label': 'Anthropic API -avain' });
     ag.append(h('div', { class: 'gitem', style: { gridTemplateColumns: '1fr' } },
@@ -2623,7 +2736,8 @@ function renderSettings(root) {
       h('button', { class: 'btn secondary', type: 'button', onclick: async () => {
         const v = kin.value.trim();
         if (!/^sk-ant-[\w-]{20,}$/.test(v)) { toast('Avain alkaa sk-ant- ja on pitkä merkkijono.'); return; }
-        await IDB.put('kv', 'aikey', v); setAiKey(v); toast('API-avain tallennettu'); render();
+        try { await IDB.put('kv', 'aikey', v); } catch (e) { toast('Avainta ei voitu tallentaa tässä selaimessa. Avaa Annos Chromessa.'); return; }
+        setAiKey(v); toast('API-avain tallennettu'); render();
       } }, 'Tallenna avain')));
   }
   root.appendChild(ag);
@@ -2638,7 +2752,7 @@ function renderSettings(root) {
   grp.append(h('button', { class: 'gitem', type: 'button', onclick: exportCsv }, h('div', null, h('div', null, 'Vie päiväkirja taulukkona'), h('div', { class: 'gs' }, 'CSV-tiedosto Exceliin tai Google Sheetsiin')), icon('download')));
   const imp = h('input', { type: 'file', accept: '.json,application/json', class: 'sr', tabindex: '-1', 'aria-hidden': 'true', onchange: e => { const f = e.target.files[0]; e.target.value = ''; if (f) importJson(f); } });
   grp.append(h('button', { class: 'gitem', type: 'button', onclick: () => imp.click() }, h('div', null, h('div', null, 'Tuo varmuuskopio'), h('div', { class: 'gs' }, 'Myös Claude-version varmuuskopio käy')), icon('upload')), imp);
-  grp.append(h('button', { class: 'gitem', type: 'button', onclick: deleteAll }, h('div', null, h('div', { style: { color: 'var(--danger)' } }, 'Poista kaikki tiedot'), h('div', { class: 'gs' }, 'Päiväkirja, omat tuotteet ja asetukset')), icon('trash')));
+  grp.append(h('button', { class: 'gitem', type: 'button', onclick: deleteAll }, h('div', null, h('div', { style: { color: 'var(--danger)' } }, 'Poista kaikki tiedot'), h('div', { class: 'gs' }, 'Päiväkirja, omat tuotteet, asetukset ja API-avain')), icon('trash')));
   root.appendChild(grp);
 
   // Sovellus
@@ -2775,7 +2889,7 @@ async function exportCsv() {
   try {
     const all = await gatherAll();
     const c = v => v == null ? '' : String(Math.round(v * 10) / 10).replace('.', ',');
-    const q = t => '"' + String(t || '').replace(/"/g, '""') + '"';
+    const q = t => { let v = String(t || ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
     const lines = ['Päivä;Ateria;Ruoka;Merkki;Määrä (g);Energia (kcal);Proteiini (g);Hiilihydraatit (g);josta sokereita (g);Rasva (g);josta tyydyttyneitä (g);Ravintokuitu (g);Suola (g)'];
     for (const d of all.days) for (const e of d.entries || []) {
       const v = scaled(e.per, e.g);
@@ -2793,7 +2907,7 @@ async function exportJson() {
     toast('Varmuuskopio ladattu');
   } catch (e) { if (e && e.code !== 'declined') toast('Vienti ei onnistunut.'); }
 }
-function markBackup() { S.meta.lastBackup = Date.now(); saveMeta(); }
+function markBackup() { const t = Date.now(); mutateMeta(m => { m.lastBackup = t; }); }
 async function shareBackup() {
   try {
     const all = await gatherAll();
@@ -2803,6 +2917,55 @@ async function shareBackup() {
     markBackup();
     toast('Varmuuskopio jaettu');
   } catch (e) { if (e && e.name !== 'AbortError') exportJson(); }
+}
+// Varmuuskopion tiedot tarkistetaan ennen tallennusta, jottei rikkinäinen tiedosto kaada sovellusta
+function cleanPer(o) {
+  if (!o || typeof o !== 'object') return null;
+  const out = {};
+  for (const k of NUTS) { const v = Number(o[k]); out[k] = o[k] == null || o[k] === '' || !isFinite(v) || v < 0 || v >= 100000 ? null : v; }
+  return out.kcal == null ? null : out;
+}
+const str = (v, n) => typeof v === 'string' ? v.slice(0, n) : (v == null ? '' : String(v).slice(0, n));
+function cleanDay(d) {
+  if (!d || typeof d !== 'object' || !/^\d{4}-\d\d-\d\d$/.test(d.date)) return null;
+  const entries = [];
+  for (const e of Array.isArray(d.entries) ? d.entries : []) {
+    if (!e || typeof e !== 'object') continue;
+    const per = cleanPer(e.per), g = Number(e.g);
+    if (!per || !(g > 0 && g < 20000)) continue;
+    entries.push({ id: str(e.id || rid(), 40), m: MEAL[e.m] ? e.m : 'vali', n: str(e.n || 'Ruoka', 120), b: str(e.b, 60), src: str(e.src || 'ai', 10), ref: e.ref == null ? null : str(e.ref, 60),
+      g, pl: e.pl == null ? null : str(e.pl, 80), pc: Number(e.pc) > 0 ? Number(e.pc) : null, pu: e.pu == null ? null : str(e.pu, 60), per, t: Number(e.t) || Date.now() });
+  }
+  const water = Number(d.water), weight = Number(d.weight);
+  const out = { date: d.date, entries, water: water >= 0 && water < 20000 ? water : 0, weight: d.weight != null && weight > 20 && weight < 400 ? weight : null, v: 1 };
+  out.tot = sumEntries(entries); out.n = entries.length; out.u = Date.now();
+  return out;
+}
+function cleanFood(f) {
+  if (!f || typeof f !== 'object' || !f.id || !f.name) return null;
+  const per = cleanPer(f.per);
+  if (!per) return null;
+  const portions = Array.isArray(f.portions) ? f.portions.filter(p => Array.isArray(p) && typeof p[0] === 'string' && Number(p[1]) > 0).map(p => [p[0].slice(0, 60), Number(p[1])]) : [];
+  const out = Object.assign({}, f, { id: str(f.id, 40), name: str(f.name, 120), brand: str(f.brand, 60), code: str(f.code, 20).replace(/\D/g, ''), per, portions, kind: f.kind === 'recipe' ? 'recipe' : 'food' });
+  if (out.kind === 'recipe') {
+    out.ing = Array.isArray(f.ing) ? f.ing.filter(i => i && cleanPer(i.per) && Number(i.g) > 0) : [];
+    out.servings = Number(f.servings) > 0 ? Number(f.servings) : 1;
+    if (!out.portions.length) {
+      const total = Number(f.cookedG) > 0 ? Number(f.cookedG) : out.ing.reduce((a, i) => a + Number(i.g), 0);
+      out.portions = [['1 annos', Math.round((total > 0 ? total / out.servings : 100) * 10) / 10]];
+    }
+  }
+  return out;
+}
+function cleanSettings(st) {
+  const out = { v: 1, onboarded: !!st.onboarded };
+  if (st.goals && typeof st.goals === 'object') {
+    const g = {};
+    for (const k of ['kcal', 'p', 'c', 'f', 'fi', 'water']) { const v = Number(st.goals[k]); if (isFinite(v) && v >= 0 && v < 20000) g[k] = v; }
+    if (g.kcal >= 800) out.goals = g;
+  }
+  if (st.profile && typeof st.profile === 'object') out.profile = st.profile;
+  return out;
 }
 async function importJson(file) {
   let data;
@@ -2815,19 +2978,20 @@ async function importJson(file) {
   const p = h('p', null, 'Aloitetaan…');
   sh.body.append(h('div', { class: 'busy' }, h('div', { class: 'spinner' }), p));
   try {
-    if (data.settings) await S.store.setDocNow('settings', data.settings);
-    if (data.meta) await S.store.setDocNow('meta', data.meta);
+    if (data.settings && typeof data.settings === 'object') await S.store.setDocNow('settings', cleanSettings(data.settings));
+    if (data.meta && typeof data.meta === 'object') await S.store.setDocNow('meta', { recent: Array.isArray(data.meta.recent) ? data.meta.recent.filter(x => x && x.src && x.n).slice(0, 40) : [], fav: Array.isArray(data.meta.fav) ? data.meta.fav.filter(x => x && x.src && x.n).slice(0, 300) : [], lastBackup: Number(data.meta.lastBackup) || null });
     let i = 0;
-    for (const f of data.foods || []) { if (f && f.id && f.name) await S.store.setFoodNow(f); p.textContent = 'Tuotteet ' + (++i) + '/' + data.foods.length; }
+    const foods = Array.isArray(data.foods) ? data.foods : [];
+    for (const f of foods) { const c = cleanFood(f); if (c) await S.store.setFoodNow(c); p.textContent = 'Tuotteet ' + (++i) + '/' + foods.length; }
     i = 0;
-    for (const d of data.days) { if (d && /^\d{4}-\d\d-\d\d$/.test(d.date)) await S.store.setDayNow(d.date, d); p.textContent = 'Päivät ' + (++i) + '/' + data.days.length; }
+    for (const d of data.days) { const c = cleanDay(d); if (c) await S.store.setDayNow(c.date, c); p.textContent = 'Päivät ' + (++i) + '/' + data.days.length; }
     sh.modal = false; sh.close();
     await reloadAll();
     toast('Varmuuskopio tuotu');
   } catch (e) { sh.modal = false; sh.close(); onStoreError(e); toast('Tuonti keskeytyi. Osa tiedoista voi puuttua.'); }
 }
 async function deleteAll() {
-  const ok = await confirmDialog('Poistetaanko kaikki tiedot?', 'Päiväkirja, omat tuotteet, reseptit ja asetukset poistetaan pysyvästi. Vie varmuuskopio ensin, jos haluat säilyttää ne.', 'Poista kaikki', true);
+  const ok = await confirmDialog('Poistetaanko kaikki tiedot?', 'Päiväkirja, omat tuotteet, reseptit, asetukset ja API-avain poistetaan pysyvästi. Vie varmuuskopio ensin, jos haluat säilyttää ne.', 'Poista kaikki', true);
   if (!ok) return;
   const sh = sheet({ title: 'Poistetaan', center: true, modal: true });
   sh.modal = true;
@@ -2838,6 +3002,8 @@ async function deleteAll() {
     for (const f of S.foods.slice()) await S.store.deleteFood(f.id);
     await S.store.deleteDoc('meta');
     await S.store.deleteDoc('settings');
+    try { await IDB.del('kv', 'aikey'); } catch (e) { /* */ }
+    setAiKey(null);
     onboardShown = false;
     sh.modal = false; sh.close();
     await reloadAll();
@@ -2849,8 +3015,12 @@ async function deleteAll() {
    Käynnistys
    ========================================================================= */
 async function initStore() {
-  try { await IDB.open(); return new IdbStore(); }
-  catch (e) { return new LocalStore(); }
+  // Tilapäinen avausvirhe yritetään uudelleen, jottei päiväkirja jakaudu kahteen paikkaan
+  for (let i = 0; i < 3; i++) {
+    try { await IDB.open(); return new IdbStore(); }
+    catch (e) { if (!('indexedDB' in window)) break; await sleep(400 * (i + 1)); }
+  }
+  return new LocalStore();
 }
 // Kaikki tiedot luetaan uudelleen tallennuksesta (tuonnin ja poiston jälkeen)
 async function reloadAll() {
@@ -2901,7 +3071,10 @@ function makeAi(key) {
       r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST', signal: opts.signal,
         headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-        body: JSON.stringify({ model, max_tokens: opts.maxTokens || 2500, messages: [{ role: 'user', content }] })
+        body: JSON.stringify({ model, max_tokens: opts.maxTokens || 8000,
+          // Haiku 5.5 ja Sonnet 5.5 ajattelevat oletuksena; ajattelu kuluttaisi vastauksen pituusrajaa
+          thinking: { type: model === 'claude-haiku-5-5' ? 'disabled' : 'between_tools' },
+          messages: [{ role: 'user', content }] })
       });
     } catch (e) {
       if (e && e.name === 'AbortError') throw { code: 'cancelled' };
@@ -2914,6 +3087,8 @@ function makeAi(key) {
       throw { code: /credit|balance/i.test(msg) ? 'no_credit' : 'upstream_error', message: msg };
     }
     const j = await r.json();
+    if (j.stop_reason === 'refusal') throw { code: 'refused' };
+    if (j.stop_reason === 'max_tokens') throw { code: 'truncated' };
     const text = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim();
     if (!text) throw { code: 'empty_completion' };
     return text;
@@ -2926,7 +3101,7 @@ function makeAi(key) {
 function setAiKey(k) { S.aiKey = k || null; S.ai = k ? makeAi(k) : null; S.aiImages = !!k; }
 async function testAiKey() {
   toast('Testataan avainta…');
-  try { const r = await S.ai('Vastaa pelkästään sanalla: toimii', { modelTier: 'quick', maxTokens: 20 }); toast(/toimii/i.test(r.text) ? 'Avain toimii' : 'Avain toimii (vastaus: ' + r.text.slice(0, 30) + ')'); }
+  try { const r = await S.ai('Vastaa pelkästään sanalla: toimii', { modelTier: 'quick', maxTokens: 60 }); toast(/toimii/i.test(r.text) ? 'Avain toimii' : 'Avain toimii (vastaus: ' + r.text.slice(0, 30) + ')'); }
   catch (e) { toast(aiErrorText(e) || 'Testi keskeytyi'); }
 }
 
@@ -2944,12 +3119,29 @@ const Downloads = {
 };
 
 // Service worker: offline-käyttö ja päivitykset
+function applyUpdate() {
+  const w = S.swWaiting;
+  if (!w) return;
+  S.swUpdating = true;
+  w.postMessage('skip');
+  // Jos sivua ei jostain syystä ladata uudelleen, ladataan se itse hetken päästä
+  setTimeout(async () => { if (S.store && S.store.w) await S.store.w.whenIdle(); location.reload(); }, 4000);
+}
+function updateCard() {
+  if (!S.swWaiting) return null;
+  return h('section', { class: 'install-card update-card', role: 'status' },
+    h('div', { class: 'install-ico', 'aria-hidden': 'true' }, h('img', { src: 'icon-192.png', alt: '' })),
+    h('div', null, h('h3', null, 'Uusi versio on valmis'), h('p', null, 'Päivitys ottaa korjaukset käyttöön. Tietosi säilyvät.')),
+    h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', type: 'button', onclick: applyUpdate }, 'Päivitä')));
+}
 function registerSW() {
   if (!('serviceWorker' in navigator)) return;
   let reloading = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => { if (S.swUpdating && !reloading) { reloading = true; location.reload(); } });
+  navigator.serviceWorker.addEventListener('controllerchange', async () => {
+    if (S.swUpdating && !reloading) { reloading = true; if (S.store && S.store.w) await S.store.w.whenIdle(); location.reload(); }
+  });
   navigator.serviceWorker.register('sw.js').then(reg => {
-    const offer = w => toast('Uusi versio on valmis', 'Päivitä', () => { S.swUpdating = true; w.postMessage('skip'); });
+    const offer = w => { S.swWaiting = w; render(); toast('Uusi versio on valmis', 'Päivitä', applyUpdate); };
     if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting);
     reg.addEventListener('updatefound', () => {
       const w = reg.installing;
@@ -2977,18 +3169,25 @@ async function boot() {
     if (navigator.storage && navigator.storage.persisted) navigator.storage.persisted().then(p => { S.persisted = p; }).catch(() => {});
   }
   S.store.watchSettings(data => { S.settings = data; S.ready.settings = true; render(); });
-  S.store.watchMeta(data => { S.meta = Object.assign({ recent: [], fav: [] }, data || {}); S.ready.meta = true; });
+  S.store.watchMeta(metaLoaded);
   S.store.watchFoods(list => { S.foods = (list || []).filter(f => f && f.id); S.ready.foods = true; render(); });
   subscribeDay();
   registerSW();
   // Päivä vaihtuu keskiyöllä, jos sovellus on auki
   let lastToday = todayIso();
-  setInterval(() => { const t = todayIso(); if (t !== lastToday) { if (S.date === lastToday) setDate(t); lastToday = t; } }, 60000);
+  const dayCheck = () => { const t = todayIso(); if (t !== lastToday) { if (S.date === lastToday) setDate(t); lastToday = t; } };
+  setInterval(dayCheck, 60000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) dayCheck(); });
+  window.addEventListener('pageshow', dayCheck);
   setTimeout(() => Products.loadIndex().catch(() => {}), 1200);
   // Pikakuvakkeet: ?skannaa ja ?lisaa
   const qs = location.search;
   if (/skannaa/.test(qs) || /lisaa/.test(qs)) {
     history.replaceState(null, '', location.pathname);
+  } else if (history.state && history.state.annosOverlay) {
+    try { history.replaceState(null, ''); } catch (e) { /* */ }
+  }
+  if (/skannaa/.test(qs) || /lisaa/.test(qs)) {
     const wait = () => { if (S.ready.settings && S.settings && S.settings.onboarded) openAdd(mealNow(), { scan: /skannaa/.test(qs), noFocus: /skannaa/.test(qs) }); else if (!S.ready.settings) setTimeout(wait, 150); };
     wait();
   }
